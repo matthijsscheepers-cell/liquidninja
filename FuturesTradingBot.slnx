@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="FuturesTradingBot.App/FuturesTradingBot.App.csproj" />
+  <Project Path="FuturesTradingBot.Core/FuturesTradingBot.Core.csproj" />
+  <Project Path="FuturesTradingBot.Execution/FuturesTradingBot.Execution.csproj" />
+  <Project Path="FuturesTradingBot.RiskManagement/FuturesTradingBot.RiskManagement.csproj" />
+</Solution>
