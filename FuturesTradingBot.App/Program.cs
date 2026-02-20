@@ -20,6 +20,23 @@ if (args.Contains("--live"))
     return;
 }
 
+// Status dashboard
+if (args.Contains("--status"))
+{
+    if (args.Contains("--watch"))
+    {
+        int interval = args.Contains("--interval")
+            ? int.Parse(args[Array.IndexOf(args, "--interval") + 1])
+            : 30;
+        StatusMonitor.RunWatch(interval);
+    }
+    else
+    {
+        StatusMonitor.Run();
+    }
+    return;
+}
+
 // ════════════════════════════════════════════════════════════════
 //  Backtest / Reality Check Mode
 //  Strategy: TTM Squeeze Pullback + Trend Ride
