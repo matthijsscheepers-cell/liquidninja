@@ -572,6 +572,8 @@ public partial class IbkrConnector : EWrapper
 
     private Dictionary<int, List<HistoricalBar>> historicalBars = new();
     private Dictionary<int, bool> historicalDataComplete = new();
+    private Dictionary<string, int> _histReqIdByKey = new(); // Maps symbol+tag → latest reqId
+    private int _histReqIdCounter = 0; // Monotonically increasing — avoids Error 322 (duplicate ticker ID) on reconnect
 
     /// <summary>
     /// Request historical bars (auto-calculates duration)
@@ -612,8 +614,12 @@ public partial class IbkrConnector : EWrapper
         string endDateTime,
         string tag = "")
     {
+        // Use a unique incrementing reqId so reconnects never cause Error 322 (duplicate ticker ID)
+        int reqId = 5000 + Interlocked.Increment(ref _histReqIdCounter);
+
+        // Store the latest reqId for this key so GetHistoricalBars can look it up
         string key = symbol + tag;
-        int reqId = Math.Abs(key.GetHashCode()) % 10000 + 5000;
+        _histReqIdByKey[key] = reqId;
 
         historicalBars[reqId] = new List<HistoricalBar>();
         historicalDataComplete[reqId] = false;
@@ -657,7 +663,11 @@ public partial class IbkrConnector : EWrapper
     public List<HistoricalBar>? GetHistoricalBars(string symbol, int timeoutSeconds = 10, string tag = "")
     {
         string key = symbol + tag;
-        int reqId = Math.Abs(key.GetHashCode()) % 10000 + 5000;
+        if (!_histReqIdByKey.TryGetValue(key, out int reqId))
+        {
+            Console.WriteLine($"⚠️  No pending request found for key '{key}'");
+            return null;
+        }
 
         var startTime = DateTime.Now;
         while (!historicalDataComplete.GetValueOrDefault(reqId) &&
