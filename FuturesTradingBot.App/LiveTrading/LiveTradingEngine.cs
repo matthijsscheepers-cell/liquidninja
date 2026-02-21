@@ -87,15 +87,34 @@ public class LiveTradingEngine
         );
 
         // 4. Wait for HMDS (historical data farm) then fetch warmup bars
-        connector.WaitForHmds(timeoutSeconds: 30);
-        logger.LogStatus(DateTime.Now, "Fetching warmup bars...");
-        var (bars15m, bars1h) = FetchWarmupBars();
+        // Retry every 5 minutes if market is closed / HMDS unavailable (e.g. Saturday)
+        List<Bar>? bars15m = null;
+        List<Bar>? bars1h = null;
 
-        if (bars15m == null || bars1h == null || bars15m.Count < 50 || bars1h.Count < 20)
+        while (bars15m == null || bars1h == null || bars15m.Count < 50 || bars1h.Count < 20)
         {
-            logger.LogError(DateTime.Now, $"Insufficient warmup data: 15m={bars15m?.Count ?? 0}, 1h={bars1h?.Count ?? 0}");
-            connector.Disconnect();
-            return;
+            connector.WaitForHmds(timeoutSeconds: 30);
+            logger.LogStatus(DateTime.Now, "Fetching warmup bars...");
+            (bars15m, bars1h) = FetchWarmupBars();
+
+            if (bars15m == null || bars1h == null || bars15m.Count < 50 || bars1h.Count < 20)
+            {
+                int got15m = bars15m?.Count ?? 0;
+                int got1h  = bars1h?.Count  ?? 0;
+                logger.LogStatus(DateTime.Now,
+                    $"Warmup data insufficient (15m={got15m}, 1h={got1h}) — market may be closed. Retrying in 5 min...");
+                await Task.Delay(TimeSpan.FromMinutes(5));
+
+                // Reconnect before retrying (IBKR may have timed out the session)
+                if (!connector.IsConnected)
+                {
+                    connector.Disconnect();
+                    await Task.Delay(3000);
+                    connector = new IbkrConnector("127.0.0.1", 7497, clientId);
+                    if (!connector.Connect()) { logger.LogError(DateTime.Now, "Reconnect failed, giving up."); return; }
+                    await Task.Delay(3000);
+                }
+            }
         }
 
         // 5. Add indicators to warmup bars
