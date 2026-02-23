@@ -192,7 +192,7 @@ public static class StatusMonitor
         Console.WriteLine($"\n  {line}");
         Console.WriteLine($"  ██ LIQUIDNINJA — STATUS DASHBOARD");
         Console.WriteLine($"  {line}");
-        Console.WriteLine($"  {date:dddd dd MMM yyyy}  {DateTime.Now:HH:mm:ss} ET");
+        Console.WriteLine($"  {date:dddd dd MMM yyyy}  {DateTime.Now:HH:mm:ss} {TimeZoneInfo.Local.Id}");
         Console.WriteLine($"  {thin}");
 
         foreach (var state in states)
