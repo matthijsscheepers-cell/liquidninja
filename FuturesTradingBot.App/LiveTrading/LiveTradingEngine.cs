@@ -1,6 +1,7 @@
 namespace FuturesTradingBot.App.LiveTrading;
 
 using IBApi;
+using System.Text.Json;
 using FuturesTradingBot.Core.Models;
 using Bar = FuturesTradingBot.Core.Models.Bar;
 using FuturesTradingBot.Core.Indicators;
@@ -130,9 +131,20 @@ public class LiveTradingEngine
         logger.LogStatus(DateTime.Now, $"Warmup complete: {bars15m.Count} 15m bars, {bars1h.Count} 1h bars");
         logger.LogStatus(DateTime.Now, $"Last 15m bar: {bars15m.Last().Timestamp:yyyy-MM-dd HH:mm} Close: ${bars15m.Last().Close:F2}");
 
-        // 7. Wire up order events
+        // 7. Wire up order events (before state restore so reconcile callbacks work immediately)
         connector.OnOrderStatusChanged += HandleOrderStatus;
         connector.OnPositionUpdate += HandlePositionUpdate;
+
+        // 8. Restore position state from today's log (if bot was restarted mid-session)
+        bool stateRestored = RestoreStateFromLog();
+        if (stateRestored)
+        {
+            // Immediately validate against IBKR - if position was closed while we were
+            // down, HandlePositionUpdate will fire and log a RECONCILE exit
+            logger.LogStatus(DateTime.Now, "Reconciling restored state with IBKR...");
+            connector.RequestPositions();
+            await Task.Delay(3000);
+        }
 
         // CONTFUT contract for polling (works reliably for 24/7 data)
         var pollContract = new Contract
@@ -479,6 +491,150 @@ public class LiveTradingEngine
             targetOrderId = null;
             _entryConfirmed = false;
         }
+    }
+
+    /// <summary>
+    /// Reads today's JSONL log to reconstruct open position + today's stats after a restart.
+    /// Returns true if an open position was restored.
+    /// </summary>
+    private bool RestoreStateFromLog()
+    {
+        var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+        var logPath = Path.Combine(logDir, $"trades_{asset}_{DateTime.Now:yyyy-MM-dd}.jsonl");
+
+        if (!File.Exists(logPath)) return false;
+
+        string? posDir = null;
+        decimal posEntry = 0, posStop = 0, posTarget = 0, posRisk = 0;
+        int posContracts = 0;
+        string posSetup = "";
+        DateTime posTime = default;
+        int logEntryId = 0, logStopId = 0, logTargetId = 0;
+        bool logEntryConfirmed = false;
+
+        // Today's closed-trade stats
+        int recoveredTrades = 0, recoveredWins = 0, recoveredLosses = 0;
+        decimal recoveredPnL = 0;
+
+        foreach (var line in File.ReadLines(logPath))
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+
+            JsonElement doc;
+            try { doc = JsonDocument.Parse(line).RootElement; }
+            catch { continue; }
+
+            switch (doc.GetStringOrEmpty("type"))
+            {
+                case "SIGNAL":
+                    if (doc.TryGetProperty("taken", out var tp) && tp.GetBoolean())
+                    {
+                        posDir = doc.GetStringOrEmpty("direction");
+                        posEntry = doc.GetDecimalOrZero("entryPrice");
+                        posStop = doc.GetDecimalOrZero("stopLoss");
+                        posTarget = doc.GetDecimalOrZero("target");
+                        posSetup = doc.GetStringOrEmpty("setupType");
+                        posRisk = doc.GetDecimalOrZero("riskPerShare");
+                        posContracts = 1;
+                        var ts = doc.GetStringOrEmpty("time");
+                        posTime = DateTime.TryParse(ts, out var pt) ? pt : DateTime.Now;
+                        logEntryId = 0; logStopId = 0; logTargetId = 0;
+                        logEntryConfirmed = false;
+                    }
+                    break;
+
+                case "ORDER":
+                    if (posDir != null)
+                    {
+                        var oType = doc.GetStringOrEmpty("orderType");
+                        var oId = doc.TryGetProperty("orderId", out var oid) ? oid.GetInt32() : 0;
+                        var oAction = doc.GetStringOrEmpty("action");
+
+                        if (oType == "STP")
+                            logStopId = oId;
+                        else if (oType == "LMT")
+                        {
+                            bool isEntryDir = (posDir == "LONG" && oAction == "BUY") ||
+                                             (posDir == "SHORT" && oAction == "SELL");
+                            if (isEntryDir) logEntryId = oId;
+                            else            logTargetId = oId;
+                        }
+                    }
+                    break;
+
+                case "FILL":
+                    if (posDir != null && logEntryId != 0)
+                    {
+                        var fId = doc.TryGetProperty("orderId", out var fo) ? fo.GetInt32() : 0;
+                        if (fId == logEntryId)
+                        {
+                            posEntry = doc.GetDecimalOrZero("fillPrice");
+                            logEntryConfirmed = true;
+                        }
+                    }
+                    break;
+
+                case "STOP_UPDATE":
+                    if (posDir != null)
+                        posStop = doc.GetDecimalOrZero("newStop");
+                    break;
+
+                case "EXIT":
+                    var pnl = doc.GetDecimalOrZero("pnl");
+                    recoveredTrades++;
+                    recoveredPnL += pnl;
+                    if (pnl > 0) recoveredWins++;
+                    else if (pnl < 0) recoveredLosses++;
+                    // Clear position state
+                    posDir = null;
+                    logEntryId = 0; logStopId = 0; logTargetId = 0;
+                    logEntryConfirmed = false;
+                    break;
+            }
+        }
+
+        // Restore today's closed-trade stats
+        if (recoveredTrades > 0)
+        {
+            totalTrades = recoveredTrades;
+            wins = recoveredWins;
+            losses = recoveredLosses;
+            totalPnL = recoveredPnL;
+            currentBalance = startingBalance + recoveredPnL;
+            logger.LogStatus(DateTime.Now,
+                $"Restored today's stats: {recoveredTrades} trades ({recoveredWins}W/{recoveredLosses}L), P&L=${recoveredPnL:F2}");
+        }
+
+        // Restore open position if one was in flight
+        if (posDir == null || logEntryId == 0) return false;
+
+        var direction = posDir == "LONG" ? SignalDirection.LONG : SignalDirection.SHORT;
+        openPosition = new Position
+        {
+            Asset = asset,
+            Direction = direction,
+            EntryPrice = posEntry,
+            StopLoss = posStop,
+            Target = posTarget,
+            Contracts = posContracts,
+            RiskPerContract = posRisk * Multipliers.GetValueOrDefault(asset, 10m),
+            EntryTime = posTime,
+            EntryBar = barIndex,
+            EntryStrategy = posSetup
+        };
+
+        entryOrderId = logEntryId;
+        stopOrderId  = logStopId  != 0 ? logStopId  : null;
+        targetOrderId = logTargetId != 0 ? logTargetId : null;
+        _entryConfirmed = logEntryConfirmed;
+
+        logger.LogStatus(DateTime.Now,
+            $"Restored position: {posDir} {asset} @ ${posEntry:F2} " +
+            $"stop=${posStop:F2} target=${posTarget:F2} " +
+            $"entryFilled={logEntryConfirmed} " +
+            $"orders: entry=#{logEntryId} stop=#{logStopId} target=#{logTargetId}");
+
+        return true;
     }
 
     private (List<Bar>? bars15m, List<Bar>? bars1h) FetchWarmupBars()
