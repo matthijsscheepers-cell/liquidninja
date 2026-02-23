@@ -47,6 +47,18 @@ public class LiveTradingEngine
         { "MES", 5m },
     };
 
+    private static readonly Dictionary<string, decimal> TickSizes = new()
+    {
+        { "MGC", 0.10m },
+        { "MES", 0.25m },
+    };
+
+    private decimal RoundToTick(decimal price)
+    {
+        var tick = TickSizes.GetValueOrDefault(asset, 0.01m);
+        return Math.Round(price / tick, MidpointRounding.AwayFromZero) * tick;
+    }
+
     public LiveTradingEngine(string asset, decimal balance = 25000m, decimal maxDailyLoss = 1250m)
     {
         this.asset = asset;
@@ -317,12 +329,13 @@ public class LiveTradingEngine
                 if (stopOrderId.HasValue && exitPrice.HasValue)
                 {
                     var oldStop = openPosition.StopLoss;
-                    if (exitPrice.Value != oldStop)
+                    decimal newStop = RoundToTick(exitPrice.Value);
+                    if (newStop != oldStop)
                     {
                         string action = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
-                        connector.ModifyStopOrder(stopOrderId.Value, contract, action, exitPrice.Value, openPosition.Contracts);
-                        logger.LogStopUpdate(now, oldStop, exitPrice.Value);
-                        openPosition.StopLoss = exitPrice.Value;
+                        connector.ModifyStopOrder(stopOrderId.Value, contract, action, newStop, openPosition.Contracts);
+                        logger.LogStopUpdate(now, oldStop, newStop);
+                        openPosition.StopLoss = newStop;
                     }
                 }
             }
@@ -344,13 +357,18 @@ public class LiveTradingEngine
                 {
                     logger.LogSignal(now, setup, true, $"Approved: {decision.Contracts} contracts");
 
+                    // Round prices to contract minimum tick before placing (Error 110 prevention)
+                    decimal roundedEntry  = RoundToTick(setup.EntryPrice);
+                    decimal roundedStop   = RoundToTick(setup.StopLoss);
+                    decimal roundedTarget = RoundToTick(setup.Target);
+
                     // Place bracket order on IBKR
                     var parentId = connector.PlaceBracketOrder(
                         contract,
                         setup.Direction,
-                        setup.EntryPrice,
-                        setup.StopLoss,
-                        setup.Target,
+                        roundedEntry,
+                        roundedStop,
+                        roundedTarget,
                         decision.Contracts
                     );
 
@@ -358,18 +376,18 @@ public class LiveTradingEngine
                     stopOrderId = parentId + 1;
                     targetOrderId = parentId + 2;
 
-                    logger.LogOrder(now, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", setup.EntryPrice, decision.Contracts);
-                    logger.LogOrder(now, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", setup.StopLoss, decision.Contracts);
-                    logger.LogOrder(now, parentId + 2, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "LMT", setup.Target, decision.Contracts);
+                    logger.LogOrder(now, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, decision.Contracts);
+                    logger.LogOrder(now, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, decision.Contracts);
+                    logger.LogOrder(now, parentId + 2, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "LMT", roundedTarget, decision.Contracts);
 
                     // Create position object (will be confirmed on fill)
                     openPosition = new Position
                     {
                         Asset = asset,
                         Direction = setup.Direction,
-                        EntryPrice = setup.EntryPrice,
-                        StopLoss = setup.StopLoss,
-                        Target = setup.Target,
+                        EntryPrice = roundedEntry,
+                        StopLoss = roundedStop,
+                        Target = roundedTarget,
                         Contracts = decision.Contracts,
                         RiskPerContract = setup.RiskPerShare * Multipliers.GetValueOrDefault(asset, 10m),
                         EntryTime = now,
@@ -514,6 +532,10 @@ public class LiveTradingEngine
                 if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
                 if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
                 if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+
+                // Set cooldown so strategy doesn't immediately re-enter on the next bar
+                if (strategy is TTMSqueezePullbackStrategy ttmNoFill)
+                    ttmNoFill.SetLastExitBar(barIndex);
             }
 
             // Reset position state in both cases
