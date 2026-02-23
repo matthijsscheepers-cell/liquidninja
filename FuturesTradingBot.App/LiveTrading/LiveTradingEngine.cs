@@ -72,13 +72,18 @@ public class LiveTradingEngine
         }
         Thread.Sleep(3000);
 
-        // 2. Create contract
-        contract = asset switch
+        // 2. Resolve front-month contract by asking IBKR directly (avoids hard-coded expiry dates)
+        string exchange = asset == "MGC" ? "COMEX" : "CME";
+        var resolved = connector.ResolveFrontMonthContract(asset, "FUT", exchange);
+        if (resolved == null)
         {
-            "MGC" => ContractHelper.CreateMGC(),
-            "MES" => ContractHelper.CreateMES(),
-            _ => throw new ArgumentException($"Unknown asset: {asset}")
-        };
+            logger.LogError(DateTime.Now, $"Could not resolve front-month contract for {asset} — cannot trade safely. Exiting.");
+            connector.Disconnect();
+            return;
+        }
+        contract = resolved;
+        logger.LogStatus(DateTime.Now,
+            $"Front-month contract: {contract.Symbol} {contract.LastTradeDateOrContractMonth} (conId={contract.ConId}, exchange={contract.Exchange})");
 
         // 3. Create strategy + risk manager
         strategy = new TTMSqueezePullbackStrategy(asset);

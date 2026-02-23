@@ -239,6 +239,61 @@ public partial class IbkrConnector : EWrapper
     }
 
     // ========================================
+    // CONTRACT RESOLUTION
+    // ========================================
+
+    private readonly Dictionary<int, List<ContractDetails>> _contractDetailsResults = new();
+    private readonly Dictionary<int, ManualResetEventSlim> _contractDetailsEvents = new();
+
+    /// <summary>
+    /// Ask IBKR for all contracts matching symbol+secType+exchange and return
+    /// the front-month contract (earliest expiry on or after today).
+    /// Avoids hard-coding expiry dates that break when contracts roll.
+    /// </summary>
+    public Contract? ResolveFrontMonthContract(string symbol, string secType, string exchange)
+    {
+        int reqId = Interlocked.Increment(ref _histReqIdCounter);
+        var results = new List<ContractDetails>();
+        var done = new ManualResetEventSlim(false);
+
+        lock (_contractDetailsResults)
+        {
+            _contractDetailsResults[reqId] = results;
+            _contractDetailsEvents[reqId] = done;
+        }
+
+        var template = new Contract
+        {
+            Symbol = symbol,
+            SecType = secType,
+            Currency = "USD",
+            Exchange = exchange
+        };
+
+        clientSocket.reqContractDetails(reqId, template);
+
+        done.Wait(TimeSpan.FromSeconds(10));
+
+        lock (_contractDetailsResults)
+        {
+            _contractDetailsResults.Remove(reqId);
+            _contractDetailsEvents.Remove(reqId);
+        }
+
+        if (results.Count == 0) return null;
+
+        // Pick the front month = earliest expiry on or after today's year-month
+        var nowYM = DateTime.Now.ToString("yyyyMM");
+        var front = results
+            .Where(cd => cd.Contract.LastTradeDateOrContractMonth.Length >= 6 &&
+                         string.Compare(cd.Contract.LastTradeDateOrContractMonth[..6], nowYM) >= 0)
+            .OrderBy(cd => cd.Contract.LastTradeDateOrContractMonth)
+            .FirstOrDefault();
+
+        return front?.Contract;
+    }
+
+    // ========================================
     // ORDER EXECUTION
     // ========================================
 

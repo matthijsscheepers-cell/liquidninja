@@ -14,8 +14,23 @@ public partial class IbkrConnector
     public void accountDownloadEnd(string account) { }
     public void bondContractDetails(int reqId, ContractDetails contract) { }
     public void commissionReport(CommissionReport commissionReport) { }
-    public void contractDetails(int reqId, ContractDetails contractDetails) { }
-    public void contractDetailsEnd(int reqId) { }
+    public void contractDetails(int reqId, ContractDetails contractDetails)
+    {
+        lock (_contractDetailsResults)
+        {
+            if (_contractDetailsResults.TryGetValue(reqId, out var list))
+                list.Add(contractDetails);
+        }
+    }
+
+    public void contractDetailsEnd(int reqId)
+    {
+        lock (_contractDetailsEvents)
+        {
+            if (_contractDetailsEvents.TryGetValue(reqId, out var evt))
+                evt.Set();
+        }
+    }
     public void currentTime(long time) { }
     public void deltaNeutralValidation(int reqId, DeltaNeutralContract deltaNeutralContract) { }
     public void displayGroupList(int reqId, string groups) { }
