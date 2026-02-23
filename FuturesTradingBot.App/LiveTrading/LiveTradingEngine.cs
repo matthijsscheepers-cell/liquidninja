@@ -376,7 +376,7 @@ public class LiveTradingEngine
                     entryOrderId = parentId;
                     stopOrderId = parentId + 1;
                     targetOrderId = parentId + 2;
-                    _entryOrderPlacedAt = now;
+                    _entryOrderPlacedAt = DateTime.Now; // wall-clock time (not bar timestamp)
 
                     logger.LogOrder(now, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, decision.Contracts);
                     logger.LogOrder(now, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, decision.Contracts);
@@ -702,6 +702,7 @@ public class LiveTradingEngine
         stopOrderId  = logStopId  != 0 ? logStopId  : null;
         targetOrderId = logTargetId != 0 ? logTargetId : null;
         _entryConfirmed = logEntryConfirmed;
+        _entryOrderPlacedAt = DateTime.Now; // treat restored pending order as just placed
 
         logger.LogStatus(DateTime.Now,
             $"Restored position: {posDir} {asset} @ ${posEntry:F2} " +
