@@ -503,6 +503,9 @@ public class LiveTradingEngine
                 logger.LogStatus(now,
                     $"RECONCILE: IBKR flat, entry for {openPosition.Direction} @ ${openPosition.EntryPrice:F2} unconfirmed — clearing stale position");
 
+                // Log EXIT with pnl=0 so the status monitor sees the position as closed
+                logger.LogExit(now, openPosition, openPosition.EntryPrice, 0m, "RECONCILE_NO_FILL");
+
                 if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
                 if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
                 if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
