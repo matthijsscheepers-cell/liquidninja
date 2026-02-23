@@ -282,11 +282,25 @@ public partial class IbkrConnector : EWrapper
 
         if (results.Count == 0) return null;
 
-        // Pick the front month = earliest expiry on or after today's year-month
-        var nowYM = DateTime.Now.ToString("yyyyMM");
+        // Skip contracts expiring within 5 days (physical delivery window) and pick the nearest valid one
+        var bufferDate = DateTime.Now.Date.AddDays(5);
         var front = results
-            .Where(cd => cd.Contract.LastTradeDateOrContractMonth.Length >= 6 &&
-                         string.Compare(cd.Contract.LastTradeDateOrContractMonth[..6], nowYM) >= 0)
+            .Where(cd => {
+                var exp = cd.Contract.LastTradeDateOrContractMonth;
+                // Full YYYYMMDD (8+ chars) — parse exact day
+                if (exp.Length >= 8 &&
+                    DateTime.TryParseExact(exp[..8], "yyyyMMdd",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var dt))
+                    return dt >= bufferDate;
+                // YYYYMM only (6 chars) — compare first day of month
+                if (exp.Length >= 6 &&
+                    DateTime.TryParseExact(exp[..6] + "01", "yyyyMMdd",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var dtm))
+                    return dtm >= bufferDate;
+                return false;
+            })
             .OrderBy(cd => cd.Contract.LastTradeDateOrContractMonth)
             .FirstOrDefault();
 

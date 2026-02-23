@@ -31,6 +31,7 @@ public class LiveTradingEngine
     private int? targetOrderId;
     private bool _entryConfirmed;     // true once IBKR confirms the entry LMT was filled
     private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
+    private DateTime _entryOrderPlacedAt; // when the current bracket was submitted (for grace-period protection)
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
@@ -375,6 +376,7 @@ public class LiveTradingEngine
                     entryOrderId = parentId;
                     stopOrderId = parentId + 1;
                     targetOrderId = parentId + 2;
+                    _entryOrderPlacedAt = now;
 
                     logger.LogOrder(now, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, decision.Contracts);
                     logger.LogOrder(now, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, decision.Contracts);
@@ -520,9 +522,18 @@ public class LiveTradingEngine
             }
             else
             {
-                // Entry fill was never confirmed → LMT never executed, or fill callback
-                // was missed before we could log it. Either way IBKR shows no position.
-                // Cancel any pending bracket orders and clear state so new signals can fire.
+                // Entry fill was never confirmed → LMT never executed, or fill callback was missed.
+                // Guard: if order was placed very recently, give it time to fill (avoid false positives
+                // when the reconcile timer happens to fire right after order placement).
+                var pendingSecs = (now - _entryOrderPlacedAt).TotalSeconds;
+                if (pendingSecs < 300) // 5-minute grace period
+                {
+                    logger.LogStatus(now,
+                        $"RECONCILE: entry #{entryOrderId} pending ({pendingSecs:F0}s, grace=300s) — skipping RECONCILE_NO_FILL");
+                    return;
+                }
+
+                // Order has been pending > 5 minutes with no fill → treat as stale.
                 logger.LogStatus(now,
                     $"RECONCILE: IBKR flat, entry for {openPosition.Direction} @ ${openPosition.EntryPrice:F2} unconfirmed — clearing stale position");
 
