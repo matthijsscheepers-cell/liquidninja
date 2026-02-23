@@ -28,6 +28,7 @@ public class LiveTradingEngine
     private int? entryOrderId;
     private int? stopOrderId;
     private int? targetOrderId;
+    private bool _entryConfirmed; // true once IBKR confirms the entry LMT was filled
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
@@ -131,6 +132,7 @@ public class LiveTradingEngine
 
         // 7. Wire up order events
         connector.OnOrderStatusChanged += HandleOrderStatus;
+        connector.OnPositionUpdate += HandlePositionUpdate;
 
         // CONTFUT contract for polling (works reliably for 24/7 data)
         var pollContract = new Contract
@@ -170,8 +172,8 @@ public class LiveTradingEngine
                     lastKnownBarTime = newBarTime.Value;
             }
 
-            // Position reconciliation every 5 minutes
-            if ((DateTime.Now - lastReconcile).TotalMinutes >= 5)
+            // Position reconciliation every 60 seconds
+            if ((DateTime.Now - lastReconcile).TotalSeconds >= 60)
             {
                 connector.RequestPositions();
                 lastReconcile = DateTime.Now;
@@ -377,6 +379,7 @@ public class LiveTradingEngine
         if (orderId == entryOrderId && status == "Filled" && filled > 0)
         {
             logger.LogFill(now, orderId, avgPrice, filled);
+            _entryConfirmed = true;
 
             if (openPosition != null)
             {
@@ -419,6 +422,7 @@ public class LiveTradingEngine
                 entryOrderId = null;
                 stopOrderId = null;
                 targetOrderId = null;
+                _entryConfirmed = false;
             }
         }
 
@@ -430,6 +434,50 @@ public class LiveTradingEngine
             entryOrderId = null;
             stopOrderId = null;
             targetOrderId = null;
+            _entryConfirmed = false;
+        }
+    }
+
+    private void HandlePositionUpdate(string symbol, int ibkrQty)
+    {
+        // Only handle our asset (IBKR reports the underlying symbol, e.g. "MGC" or "MES")
+        if (!symbol.Equals(asset, StringComparison.OrdinalIgnoreCase)) return;
+
+        // If IBKR says flat (qty=0) but we believe the entry was filled and a position is open
+        // → the stop or target was hit while we were offline (e.g. IBKR Mobile disconnected Gateway)
+        if (ibkrQty == 0 && openPosition != null && _entryConfirmed)
+        {
+            var now = DateTime.Now;
+            var lastClose = aggregator.Bars15Min.LastOrDefault()?.Close ?? openPosition.EntryPrice;
+
+            var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
+            decimal priceMove = openPosition.Direction == SignalDirection.LONG
+                ? lastClose - openPosition.EntryPrice
+                : openPosition.EntryPrice - lastClose;
+
+            decimal pnl = priceMove * multiplier * openPosition.Contracts;
+
+            logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {openPosition.Direction} open @ ${openPosition.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
+            logger.LogExit(now, openPosition, lastClose, pnl, "RECONCILE");
+
+            // Update stats
+            totalTrades++;
+            totalPnL += pnl;
+            currentBalance += pnl;
+            if (pnl > 0) wins++;
+            else if (pnl < 0) losses++;
+
+            riskManager.RecordTradeResult(pnl, pnl > 0, now);
+
+            if (strategy is TTMSqueezePullbackStrategy ttm)
+                ttm.SetLastExitBar(barIndex);
+
+            // Reset position state
+            openPosition = null;
+            entryOrderId = null;
+            stopOrderId = null;
+            targetOrderId = null;
+            _entryConfirmed = false;
         }
     }
 
