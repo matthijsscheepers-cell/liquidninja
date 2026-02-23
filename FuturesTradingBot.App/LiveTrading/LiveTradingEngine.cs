@@ -455,36 +455,53 @@ public class LiveTradingEngine
         // Only handle our asset (IBKR reports the underlying symbol, e.g. "MGC" or "MES")
         if (!symbol.Equals(asset, StringComparison.OrdinalIgnoreCase)) return;
 
-        // If IBKR says flat (qty=0) but we believe the entry was filled and a position is open
-        // → the stop or target was hit while we were offline (e.g. IBKR Mobile disconnected Gateway)
-        if (ibkrQty == 0 && openPosition != null && _entryConfirmed)
+        // IBKR says flat but bot thinks a position is open
+        if (ibkrQty == 0 && openPosition != null)
         {
             var now = DateTime.Now;
-            var lastClose = aggregator.Bars15Min.LastOrDefault()?.Close ?? openPosition.EntryPrice;
 
-            var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
-            decimal priceMove = openPosition.Direction == SignalDirection.LONG
-                ? lastClose - openPosition.EntryPrice
-                : openPosition.EntryPrice - lastClose;
+            if (_entryConfirmed)
+            {
+                // Entry was confirmed filled → position was closed while we were offline
+                // (stop or target hit, or IBKR Mobile disconnected Gateway session)
+                var lastClose = aggregator.Bars15Min.LastOrDefault()?.Close ?? openPosition.EntryPrice;
 
-            decimal pnl = priceMove * multiplier * openPosition.Contracts;
+                var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
+                decimal priceMove = openPosition.Direction == SignalDirection.LONG
+                    ? lastClose - openPosition.EntryPrice
+                    : openPosition.EntryPrice - lastClose;
 
-            logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {openPosition.Direction} open @ ${openPosition.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
-            logger.LogExit(now, openPosition, lastClose, pnl, "RECONCILE");
+                decimal pnl = priceMove * multiplier * openPosition.Contracts;
 
-            // Update stats
-            totalTrades++;
-            totalPnL += pnl;
-            currentBalance += pnl;
-            if (pnl > 0) wins++;
-            else if (pnl < 0) losses++;
+                logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {openPosition.Direction} open @ ${openPosition.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
+                logger.LogExit(now, openPosition, lastClose, pnl, "RECONCILE");
 
-            riskManager.RecordTradeResult(pnl, pnl > 0, now);
+                // Update stats
+                totalTrades++;
+                totalPnL += pnl;
+                currentBalance += pnl;
+                if (pnl > 0) wins++;
+                else if (pnl < 0) losses++;
 
-            if (strategy is TTMSqueezePullbackStrategy ttm)
-                ttm.SetLastExitBar(barIndex);
+                riskManager.RecordTradeResult(pnl, pnl > 0, now);
 
-            // Reset position state
+                if (strategy is TTMSqueezePullbackStrategy ttm)
+                    ttm.SetLastExitBar(barIndex);
+            }
+            else
+            {
+                // Entry fill was never confirmed → LMT never executed, or fill callback
+                // was missed before we could log it. Either way IBKR shows no position.
+                // Cancel any pending bracket orders and clear state so new signals can fire.
+                logger.LogStatus(now,
+                    $"RECONCILE: IBKR flat, entry for {openPosition.Direction} @ ${openPosition.EntryPrice:F2} unconfirmed — clearing stale position");
+
+                if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+                if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+            }
+
+            // Reset position state in both cases
             openPosition = null;
             entryOrderId = null;
             stopOrderId = null;
