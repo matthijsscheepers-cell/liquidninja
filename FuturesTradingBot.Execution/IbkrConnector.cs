@@ -247,6 +247,7 @@ public partial class IbkrConnector : EWrapper
 
     public event Action<int, string, decimal, decimal>? OnOrderStatusChanged; // orderId, status, filled, avgPrice
     public event Action<string, int>? OnPositionUpdate; // symbol, qty
+    public event Action? OnPositionEnd;                  // fired when all positions have been reported
     public event Action? OnReconnected; // fired when IBKR connection is restored
 
     /// <summary>

@@ -29,7 +29,8 @@ public class LiveTradingEngine
     private int? entryOrderId;
     private int? stopOrderId;
     private int? targetOrderId;
-    private bool _entryConfirmed; // true once IBKR confirms the entry LMT was filled
+    private bool _entryConfirmed;     // true once IBKR confirms the entry LMT was filled
+    private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
@@ -134,14 +135,17 @@ public class LiveTradingEngine
         // 7. Wire up order events (before state restore so reconcile callbacks work immediately)
         connector.OnOrderStatusChanged += HandleOrderStatus;
         connector.OnPositionUpdate += HandlePositionUpdate;
+        connector.OnPositionEnd += HandlePositionEnd;
 
         // 8. Restore position state from today's log (if bot was restarted mid-session)
         bool stateRestored = RestoreStateFromLog();
         if (stateRestored)
         {
             // Immediately validate against IBKR - if position was closed while we were
-            // down, HandlePositionUpdate will fire and log a RECONCILE exit
+            // down, HandlePositionUpdate will fire and log a RECONCILE exit.
+            // If IBKR has no position for our asset, positionEnd fires → HandlePositionEnd.
             logger.LogStatus(DateTime.Now, "Reconciling restored state with IBKR...");
+            _positionSeenInReconcile = false;
             connector.RequestPositions();
             await Task.Delay(3000);
         }
@@ -187,6 +191,7 @@ public class LiveTradingEngine
             // Position reconciliation every 60 seconds
             if ((DateTime.Now - lastReconcile).TotalSeconds >= 60)
             {
+                _positionSeenInReconcile = false;
                 connector.RequestPositions();
                 lastReconcile = DateTime.Now;
             }
@@ -455,6 +460,8 @@ public class LiveTradingEngine
         // Only handle our asset (IBKR reports the underlying symbol, e.g. "MGC" or "MES")
         if (!symbol.Equals(asset, StringComparison.OrdinalIgnoreCase)) return;
 
+        _positionSeenInReconcile = true; // IBKR reported this asset in the current cycle
+
         // IBKR says flat but bot thinks a position is open
         if (ibkrQty == 0 && openPosition != null)
         {
@@ -507,6 +514,16 @@ public class LiveTradingEngine
             stopOrderId = null;
             targetOrderId = null;
             _entryConfirmed = false;
+        }
+    }
+
+    private void HandlePositionEnd()
+    {
+        // IBKR finished reporting all positions. If our asset was NOT in the list,
+        // it means we have no position at IBKR — treat it as qty=0.
+        if (!_positionSeenInReconcile && openPosition != null)
+        {
+            HandlePositionUpdate(asset, 0);
         }
     }
 

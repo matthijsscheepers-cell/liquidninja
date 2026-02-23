@@ -111,7 +111,7 @@ public partial class IbkrConnector
         if (qty != 0)
             Console.WriteLine($"📊 Position: {symbol} = {qty} contracts @ ${avgCost:F2}");
     }
-    public void positionEnd() { }
+    public void positionEnd() { OnPositionEnd?.Invoke(); }
     public void positionMulti(int reqId, string account, string modelCode, Contract contract, double pos, double avgCost) { }
     public void positionMultiEnd(int reqId) { }
     public void realtimeBar(int reqId, long date, double open, double high, double low, double close, long volume, double WAP, int count)
