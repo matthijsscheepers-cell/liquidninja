@@ -485,11 +485,11 @@ public class LiveTradingEngine
 
         _positionSeenInReconcile = true; // IBKR reported this asset in the current cycle
 
-        // IBKR says flat but bot thinks a position is open
+        var now = DateTime.Now;
+
+        // Case A: IBKR says flat but bot thinks a position is open
         if (ibkrQty == 0 && openPosition != null)
         {
-            var now = DateTime.Now;
-
             if (_entryConfirmed)
             {
                 // Entry was confirmed filled → position was closed while we were offline
@@ -553,6 +553,42 @@ public class LiveTradingEngine
             stopOrderId = null;
             targetOrderId = null;
             _entryConfirmed = false;
+            return;
+        }
+
+        // Case B: IBKR has a position but bot has none — unexpected (ghost position)
+        if (ibkrQty != 0 && openPosition == null)
+        {
+            logger.LogStatus(now, $"RECONCILE WARNING: IBKR shows {asset} qty={ibkrQty} but bot has no open position — possible ghost position, check TWS manually");
+            return;
+        }
+
+        // Case C: Both IBKR and bot have a position — check sign matches
+        if (ibkrQty != 0 && openPosition != null)
+        {
+            int expectedSign = openPosition.Direction == SignalDirection.LONG ? 1 : -1;
+            if (Math.Sign(ibkrQty) != expectedSign)
+            {
+                // IBKR position direction contradicts our internal state — something went wrong
+                // (e.g. stop hit + OCA failed → extra buy turned SHORT into LONG)
+                logger.LogStatus(now,
+                    $"RECONCILE MISMATCH: IBKR {asset} qty={ibkrQty} but bot expects {(openPosition.Direction == SignalDirection.LONG ? "+1 LONG" : "-1 SHORT")} — clearing bot state, check TWS");
+                logger.LogExit(now, openPosition, openPosition.EntryPrice, 0m, "RECONCILE_MISMATCH");
+
+                if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+                if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+
+                if (strategy is TTMSqueezePullbackStrategy ttmMismatch)
+                    ttmMismatch.SetLastExitBar(barIndex);
+
+                openPosition = null;
+                entryOrderId = null;
+                stopOrderId = null;
+                targetOrderId = null;
+                _entryConfirmed = false;
+            }
+            // else: sign matches — position is as expected, nothing to do
         }
     }
 

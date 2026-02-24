@@ -10,6 +10,87 @@ using FuturesTradingBot.Execution;
 //  LIQUIDNINJA - Live Paper Trading / Reality Check
 // ════════════════════════════════════════════════════════════════
 
+// Emergency flatten: close any open position for an asset via market order
+// Usage: dotnet run --project FuturesTradingBot.App -- --flatten MGC
+if (args.Contains("--flatten"))
+{
+    var flattenIdx = Array.IndexOf(args, "--flatten");
+    var flattenAsset = flattenIdx + 1 < args.Length ? args[flattenIdx + 1] : "MGC";
+    string flattenExchange = flattenAsset == "MGC" ? "COMEX" : "CME";
+    int flattenClientId = 99; // dedicated clientId to avoid conflicts
+
+    Console.WriteLine($"⚠️  FLATTEN: closing {flattenAsset} position via market order...");
+
+    var flattenConnector = new IbkrConnector("127.0.0.1", 7497, flattenClientId);
+    if (!flattenConnector.Connect())
+    {
+        Console.WriteLine("❌ Failed to connect to IBKR");
+        return;
+    }
+    Thread.Sleep(3000);
+
+    // Resolve the front-month contract
+    var flattenContract = flattenConnector.ResolveFrontMonthContract(flattenAsset, "FUT", flattenExchange);
+    if (flattenContract == null)
+    {
+        Console.WriteLine($"❌ Could not resolve {flattenAsset} contract");
+        flattenConnector.Disconnect();
+        return;
+    }
+    Console.WriteLine($"✅ Contract: {flattenContract.Symbol} {flattenContract.LastTradeDateOrContractMonth}");
+
+    // Request current positions first to know direction
+    int ibkrQty = 0;
+    var posReceived = new System.Threading.ManualResetEventSlim(false);
+    flattenConnector.OnPositionUpdate += (sym, qty) =>
+    {
+        if (sym.Equals(flattenAsset, StringComparison.OrdinalIgnoreCase))
+            ibkrQty = qty;
+    };
+    flattenConnector.OnPositionEnd += () => posReceived.Set();
+    flattenConnector.RequestPositions();
+    posReceived.Wait(TimeSpan.FromSeconds(5));
+
+    Console.WriteLine($"📊 IBKR {flattenAsset} position: {ibkrQty}");
+
+    if (ibkrQty == 0)
+    {
+        Console.WriteLine("✅ Already flat — nothing to do");
+        flattenConnector.Disconnect();
+        return;
+    }
+
+    // Place market order in opposite direction to flatten
+    string flattenAction = ibkrQty > 0 ? "SELL" : "BUY";
+    int flattenQty = Math.Abs(ibkrQty);
+    Console.WriteLine($"📤 Placing {flattenAction} MKT {flattenQty}x {flattenAsset}...");
+    flattenConnector.PlaceMarketOrder(flattenContract, flattenAction, flattenQty);
+
+    // Wait for fill confirmation
+    bool fillReceived = false;
+    flattenConnector.OnOrderStatusChanged += (orderId, status, filled, avgPrice) =>
+    {
+        Console.WriteLine($"  Order #{orderId}: {status} filled={filled} @ ${avgPrice:F2}");
+        if (status == "Filled") fillReceived = true;
+    };
+
+    int waited = 0;
+    while (!fillReceived && waited < 15)
+    {
+        Thread.Sleep(1000);
+        waited++;
+    }
+
+    if (fillReceived)
+        Console.WriteLine($"✅ {flattenAsset} flattened successfully");
+    else
+        Console.WriteLine($"⚠️  No fill confirmation within 15s — check TWS/Gateway");
+
+    Thread.Sleep(1000);
+    flattenConnector.Disconnect();
+    return;
+}
+
 // Live trading mode
 if (args.Contains("--live"))
 {
