@@ -93,7 +93,7 @@ public partial class IbkrConnector
         else if (timeStr.Contains(" "))
             return DateTime.ParseExact(timeStr, "yyyyMMdd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
         else
-            return DateTimeOffset.FromUnixTimeSeconds(long.Parse(timeStr)).DateTime;
+            return DateTimeOffset.FromUnixTimeSeconds(long.Parse(timeStr)).LocalDateTime;
     }
     public void historicalDataUpdate(int reqId, Bar bar)
     {
