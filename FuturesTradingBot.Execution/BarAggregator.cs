@@ -272,6 +272,40 @@ public class BarAggregator
         }
     }
 
+    /// <summary>
+    /// The wall-clock time at which the current in-progress streaming bar ends.
+    /// Returns null if no bar is being tracked.
+    /// </summary>
+    public DateTime? CurrentBarEndTime =>
+        _currentStreamingBar?.Timestamp.AddMinutes(15);
+
+    /// <summary>
+    /// Called after SeedBars when the last warmup bar is still in-progress (IBKR includes
+    /// the current partial bar in historical data responses). Moves the last bar from
+    /// bars15Min into _currentStreamingBar so streaming/poll updates can refresh its OHLCV
+    /// before it is sealed via ForceCompleteCurrentBar.
+    /// </summary>
+    public void MarkLastBarAsInProgress()
+    {
+        if (bars15Min.Count == 0) return;
+        _currentStreamingBar = bars15Min.Last();
+        bars15Min.RemoveAt(bars15Min.Count - 1);
+    }
+
+    /// <summary>
+    /// Force-seals the current in-progress streaming bar into bars15Min.
+    /// Call this when the wall clock has passed CurrentBarEndTime and
+    /// historicalDataUpdate hasn't fired (IBKR Gateway streaming limitation).
+    /// </summary>
+    public void ForceCompleteCurrentBar()
+    {
+        if (_currentStreamingBar == null) return;
+        bars15Min.Add(_currentStreamingBar);
+        AggregateStreamingToHour(_currentStreamingBar);
+        new15MinBarCompleted = true;
+        _currentStreamingBar = null;
+    }
+
     public (int min1, int min15, int hour1) GetBarCounts()
     {
         return (bars1Min.Count, bars15Min.Count, bars1Hour.Count);

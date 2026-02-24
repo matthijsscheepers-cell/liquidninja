@@ -35,6 +35,7 @@ public class LiveTradingEngine
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
+    private DateTime _lastBarPoll = DateTime.MinValue;
 
     // Stats
     private int totalTrades;
@@ -145,6 +146,13 @@ public class LiveTradingEngine
         // 6. Seed aggregator
         aggregator = new BarAggregator(asset);
         aggregator.SeedBars(bars15m, bars1h);
+
+        // IBKR includes the current in-progress bar in historical data responses.
+        // Move it out of bars15Min into _currentStreamingBar so the polling fallback
+        // can refresh its OHLCV data and then force-seal it correctly.
+        if (bars15m.Count > 0 && DateTime.Now < bars15m.Last().Timestamp.AddMinutes(15))
+            aggregator.MarkLastBarAsInProgress();
+
         barIndex = bars15m.Count;
 
         logger.LogStatus(DateTime.Now, $"Warmup complete: {bars15m.Count} 15m bars, {bars1h.Count} 1h bars");
@@ -203,6 +211,14 @@ public class LiveTradingEngine
             await Task.Delay(5000);
 
             if (!connector.IsConnected) continue;
+
+            // Polling fallback: historicalDataUpdate doesn't fire reliably for 15-min bars
+            // on IBKR Gateway — poll every 90 seconds to detect new completed bars.
+            if ((DateTime.Now - _lastBarPoll).TotalSeconds >= 90)
+            {
+                _lastBarPoll = DateTime.Now;
+                await Task.Run(() => PollLatestBars());
+            }
 
             // Process a newly completed 15-min bar (flag auto-resets after read)
             if (aggregator.New15MinBarCompleted)
@@ -745,6 +761,38 @@ public class LiveTradingEngine
             $"orders: entry=#{logEntryId} stop=#{logStopId} target=#{logTargetId}");
 
         return true;
+    }
+
+    /// <summary>
+    /// Polling fallback: requests the last 2 hours of 15-min bars and feeds any new
+    /// completed bars through the aggregator. Handles the case where IBKR Gateway
+    /// doesn't send historicalDataUpdate callbacks for 15-min bars.
+    /// </summary>
+    private void PollLatestBars()
+    {
+        var contfutContract = new Contract
+        {
+            Symbol = asset,
+            SecType = "CONTFUT",
+            Currency = "USD",
+            Exchange = asset == "MGC" ? "COMEX" : "CME"
+        };
+
+        connector.RequestHistoricalBarsDirect(asset, contfutContract, "7200 S", "15 mins", tag: "_poll");
+        var rawBars = connector.GetHistoricalBars(asset, timeoutSeconds: 15, tag: "_poll");
+
+        if (rawBars != null && rawBars.Count > 0)
+        {
+            foreach (var hb in rawBars)
+                aggregator.UpdateStreamingBar(hb.Time, hb.Open, hb.High, hb.Low, hb.Close, hb.Volume);
+        }
+
+        // Force-seal the current in-progress bar if its 15-min window has elapsed.
+        // This fires when historicalDataUpdate doesn't push updates (IBKR Gateway limitation
+        // with keepUpToDate=true on 15-min bars). The poll above refreshes the bar's data
+        // before sealing so we always close with the latest available OHLCV.
+        if (aggregator.CurrentBarEndTime.HasValue && DateTime.Now >= aggregator.CurrentBarEndTime.Value)
+            aggregator.ForceCompleteCurrentBar();
     }
 
     private (List<Bar>? bars15m, List<Bar>? bars1h) FetchWarmupBars()
