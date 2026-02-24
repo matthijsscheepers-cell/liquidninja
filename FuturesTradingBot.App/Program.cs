@@ -21,19 +21,27 @@ if (args.Contains("--live"))
 }
 
 // Status dashboard
+// Usage: --status          → single snapshot
+//        --status 5        → watch mode, refresh every 5 seconds
+//        --status --watch  → watch mode, 30s default
 if (args.Contains("--status"))
 {
-    if (args.Contains("--watch"))
-    {
-        int interval = args.Contains("--interval")
+    var statusIdx = Array.IndexOf(args, "--status");
+    int watchInterval = 0;
+
+    // --status <N>  → watch with N-second interval
+    if (statusIdx + 1 < args.Length && int.TryParse(args[statusIdx + 1], out var parsed))
+        watchInterval = parsed;
+    // --status --watch [--interval N]
+    else if (args.Contains("--watch"))
+        watchInterval = args.Contains("--interval")
             ? int.Parse(args[Array.IndexOf(args, "--interval") + 1])
             : 30;
-        StatusMonitor.RunWatch(interval);
-    }
+
+    if (watchInterval > 0)
+        StatusMonitor.RunWatch(watchInterval);
     else
-    {
         StatusMonitor.Run();
-    }
     return;
 }
 
@@ -123,6 +131,25 @@ else
 }
 
 // ══════════════════════════════════════════════════════
+//  STEP 3b: HISTOGRAM COLOR BREAKDOWN
+// ══════════════════════════════════════════════════════
+
+Console.WriteLine("\n════════════════════════════════════════════");
+Console.WriteLine("HISTOGRAM COLOR BREAKDOWN (per direction)");
+Console.WriteLine("════════════════════════════════════════════\n");
+
+if (mgcResult != null)
+{
+    Console.WriteLine("── MGC ──");
+    Console.Write(mgcResult.HistogramColorBreakdown());
+}
+if (mesResult != null)
+{
+    Console.WriteLine("\n── MES ──");
+    Console.Write(mesResult.HistogramColorBreakdown());
+}
+
+// ══════════════════════════════════════════════════════
 //  STEP 4: CHALLENGE SIMULATION
 // ══════════════════════════════════════════════════════
 
@@ -167,17 +194,31 @@ Console.WriteLine($"════════════════════
         Exchange = exchange
     };
 
-    // ── Fetch 1-hour bars (2 years) ──
-    Console.WriteLine($"Fetching 2Y of 1-hour bars for {symbol}...\n");
-    List<HistoricalBar>? bars1hRaw;
+    // ── Fetch 1-hour bars ──
+    // Try progressively shorter durations. If IBKR supports it, data arrives in seconds.
+    // Use 60s timeout: if data doesn't come in 60s, it won't come at all.
+    Console.WriteLine($"Fetching 1-hour bars for {symbol}...\n");
+    List<HistoricalBar>? bars1hRaw = null;
+    foreach (var dur1h in new[] { "2 Y", "1 Y", "60 D" })
     {
+        Console.WriteLine($"  Trying {dur1h} of CONTFUT 1-hour bars...");
         var conn = new IbkrConnector("127.0.0.1", 7497, nextClientId++);
         if (!conn.Connect()) { Console.WriteLine("Connection failed!"); return (null, null); }
         Thread.Sleep(3000);
+        conn.WaitForHmds(timeoutSeconds: 30);
 
-        conn.RequestHistoricalBarsDirect(symbol, contract, "2 Y", "1 hour", tag: "_1h");
-        bars1hRaw = conn.GetHistoricalBars(symbol, timeoutSeconds: 120, tag: "_1h");
+        conn.RequestHistoricalBarsDirect(symbol, contract, dur1h, "1 hour", tag: $"_1h_{dur1h}");
+        bars1hRaw = conn.GetHistoricalBars(symbol, timeoutSeconds: 60, tag: $"_1h_{dur1h}");
         conn.Disconnect();
+
+        if (bars1hRaw != null && bars1hRaw.Count > 20)
+        {
+            Console.WriteLine($"  Got {bars1hRaw.Count} 1-hour bars ({bars1hRaw.First().Time:yyyy-MM-dd} to {bars1hRaw.Last().Time:yyyy-MM-dd})\n");
+            break;
+        }
+        Console.WriteLine($"  {dur1h} returned no data, trying shorter...");
+        bars1hRaw = null;
+        Thread.Sleep(3000);
     }
 
     if (bars1hRaw == null || bars1hRaw.Count == 0)
@@ -185,46 +226,37 @@ Console.WriteLine($"════════════════════
         Console.WriteLine($"No 1-hour data received for {symbol}!");
         return (null, null);
     }
-    Console.WriteLine($"  Got {bars1hRaw.Count} 1-hour bars\n");
 
-    Thread.Sleep(5000);
+    Thread.Sleep(3000);
 
-    // ── Fetch 15-min bars in chunks ──
-    Console.WriteLine($"Fetching 15-min bars for {symbol}...\n");
+    // ── Fetch 15-min bars ──
+    // CONTFUT hard limit for 15-min: 60 D max (longer durations silently return nothing).
+    // endDateTime must stay "" — CONTFUT error 10339 if set explicitly.
+    Console.WriteLine($"Fetching 15-min bars for {symbol} (CONTFUT max ~60 D)...\n");
     var all15mBars = new List<HistoricalBar>();
 
-    for (int chunk = 0; chunk < 2; chunk++)
+    foreach (var duration in new[] { "60 D", "30 D", "10 D" })
     {
-        Console.WriteLine($"  Chunk {chunk + 1}/2...");
+        Console.WriteLine($"  Trying {duration} of CONTFUT 15-min bars...");
 
         var conn = new IbkrConnector("127.0.0.1", 7497, nextClientId++);
-        if (!conn.Connect())
-        {
-            Console.WriteLine($"  Connection failed for chunk {chunk + 1}");
-            break;
-        }
+        if (!conn.Connect()) { Console.WriteLine("  Connection failed"); break; }
         Thread.Sleep(3000);
+        conn.WaitForHmds(timeoutSeconds: 30);
 
-        string endDateTime = chunk == 0
-            ? ""
-            : DateTime.Now.AddYears(-1).ToString("yyyyMMdd HH:mm:ss");
-
-        conn.RequestHistoricalBarsDirect15m(symbol, contract, "1 Y", "15 mins", endDateTime, tag: $"_15m_{chunk}");
-        var chunkBars = conn.GetHistoricalBars(symbol, timeoutSeconds: 120, tag: $"_15m_{chunk}");
-
+        conn.RequestHistoricalBarsDirect15m(symbol, contract, duration, "15 mins", "", tag: $"_15m_{duration}");
+        var bars = conn.GetHistoricalBars(symbol, timeoutSeconds: 60, tag: $"_15m_{duration}");
         conn.Disconnect();
 
-        if (chunkBars != null && chunkBars.Count > 0)
+        if (bars != null && bars.Count > 50)
         {
-            Console.WriteLine($"  Chunk {chunk + 1}: {chunkBars.Count} bars ({chunkBars.First().Time:yyyy-MM-dd} to {chunkBars.Last().Time:yyyy-MM-dd})");
-            all15mBars.AddRange(chunkBars);
-        }
-        else
-        {
-            Console.WriteLine($"  Chunk {chunk + 1}: no data (CONTFUT endDateTime restriction)");
+            Console.WriteLine($"  Got {bars.Count} bars ({bars.First().Time:yyyy-MM-dd} to {bars.Last().Time:yyyy-MM-dd})");
+            all15mBars.AddRange(bars);
+            break;
         }
 
-        Thread.Sleep(5000);
+        Console.WriteLine($"  {duration} returned no data, trying shorter...");
+        Thread.Sleep(3000);
     }
 
     if (all15mBars.Count == 0)

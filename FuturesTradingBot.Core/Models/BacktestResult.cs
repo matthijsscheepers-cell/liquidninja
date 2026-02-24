@@ -72,6 +72,31 @@ public class BacktestResult
         MaxDrawdown = maxDD;
     }
 
+    /// <summary>
+    /// Returns a breakdown of trades grouped by Direction + HistogramColor.
+    /// Useful for analysing which histogram colour drives performance.
+    /// </summary>
+    public string HistogramColorBreakdown()
+    {
+        var groups = Trades
+            .GroupBy(t => $"{t.Direction}|{(string.IsNullOrEmpty(t.HistogramColor) ? "?" : t.HistogramColor)}")
+            .OrderBy(g => g.Key);
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"  {"Direction|Color",-26} {"Trades",7} {"Wins",5} {"Losses",7} {"Win%",7} {"P&L",10}");
+        sb.AppendLine($"  {new string('─', 64)}");
+        foreach (var g in groups)
+        {
+            int wins   = g.Count(t => t.PnL > 0);
+            int losses = g.Count(t => t.PnL < 0);
+            int total  = g.Count();
+            decimal wr  = total > 0 ? (decimal)wins / total * 100 : 0;
+            decimal pnl = g.Sum(t => t.PnL);
+            sb.AppendLine($"  {g.Key,-26} {total,7} {wins,5} {losses,7} {wr,6:F1}% {pnl,10:F2}");
+        }
+        return sb.ToString();
+    }
+
     public void CalculateChallengeMetrics()
     {
         // Largest single loss
@@ -124,4 +149,5 @@ public class BacktestTrade
     public decimal PnL { get; set; }
     public ExitAction ExitReason { get; set; }
     public string SetupType { get; set; } = string.Empty;
+    public string HistogramColor { get; set; } = string.Empty;
 }

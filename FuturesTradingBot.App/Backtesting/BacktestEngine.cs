@@ -45,6 +45,7 @@ public class BacktestEngine
         };
 
         Position? openPosition = null;
+        string currentSetupColor = "";
         decimal balance = 25000m;
         result.EquityCurve.Add(balance);
 
@@ -78,7 +79,7 @@ public class BacktestEngine
 
                 if (exitAction != ExitAction.HOLD && exitPrice.HasValue)
                 {
-                    var trade = ClosePosition(openPosition, exitPrice.Value, exitAction, tradeNumber, currentBar.Timestamp);
+                    var trade = ClosePosition(openPosition, exitPrice.Value, exitAction, tradeNumber, currentBar.Timestamp, currentSetupColor);
                     result.Trades.Add(trade);
 
                     balance += trade.PnL;
@@ -116,6 +117,7 @@ public class BacktestEngine
                     if (decision.Approved)
                     {
                         tradeNumber++;
+                        currentSetupColor = setup.Metadata.TryGetValue("histogram_color", out var hc) ? hc?.ToString() ?? "" : "";
                         openPosition = new Position
                         {
                             Asset = asset,
@@ -154,7 +156,7 @@ public class BacktestEngine
         if (openPosition != null)
         {
             var lastBar = bars15Min.Last();
-            var trade = ClosePosition(openPosition, lastBar.Close, ExitAction.TIME_EXIT, tradeNumber, lastBar.Timestamp);
+            var trade = ClosePosition(openPosition, lastBar.Close, ExitAction.TIME_EXIT, tradeNumber, lastBar.Timestamp, currentSetupColor);
             result.Trades.Add(trade);
             balance += trade.PnL;
             result.EquityCurve.Add(balance);
@@ -167,7 +169,7 @@ public class BacktestEngine
         return result;
     }
 
-    private BacktestTrade ClosePosition(Position position, decimal exitPrice, ExitAction exitReason, int tradeNumber, DateTime exitTime)
+    private BacktestTrade ClosePosition(Position position, decimal exitPrice, ExitAction exitReason, int tradeNumber, DateTime exitTime, string histogramColor = "")
     {
         decimal priceMove = position.Direction == SignalDirection.LONG
             ? exitPrice - position.EntryPrice
@@ -186,7 +188,8 @@ public class BacktestEngine
             Contracts = position.Contracts,
             PnL = pnl,
             ExitReason = exitReason,
-            SetupType = position.EntryStrategy
+            SetupType = position.EntryStrategy,
+            HistogramColor = histogramColor
         };
     }
 }

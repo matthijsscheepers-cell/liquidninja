@@ -171,6 +171,7 @@ public partial class IbkrConnector : EWrapper
         {
             // Connection restored after disconnect
             Console.WriteLine($"✅ IBKR connection restored");
+            isConnected = true;   // ← main loop was skipping on !IsConnected after reconnect
             IsHmdsConnected = true;
             OnReconnected?.Invoke();
         }

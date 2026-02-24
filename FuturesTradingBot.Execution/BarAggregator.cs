@@ -196,59 +196,51 @@ public class BarAggregator
     // STREAMING BAR SUPPORT (15-min bars from keepUpToDate)
     // ========================================
 
-    private DateTime? lastStreamingBarTime;
+    private Bar? _currentStreamingBar; // In-progress bar — NOT yet in bars15Min
 
     /// <summary>
     /// Handle a streaming 15-min bar update from IBKR (keepUpToDate=true).
-    /// IBKR sends partial updates as the current bar forms.
-    /// When the timestamp changes, the previous bar is complete → triggers New15MinBarCompleted.
+    /// IBKR sends partial (cumulative) updates while the bar is forming.
+    /// When the timestamp advances, the previous bar is sealed into bars15Min
+    /// and New15MinBarCompleted is set — so bars15Min[^1] is always the COMPLETED bar.
     /// </summary>
     public void UpdateStreamingBar(DateTime time, decimal open, decimal high, decimal low, decimal close, long volume)
     {
         var roundedTime = RoundTo15Min(time);
 
-        // Skip bars older than what we already have (initial batch overlap with warmup)
-        if (bars15Min.Count > 0 && roundedTime < bars15Min.Last().Timestamp)
+        // Skip any bar at or before the last warmup bar (initial batch overlap)
+        if (bars15Min.Count > 0 && roundedTime <= bars15Min.Last().Timestamp)
             return;
 
-        if (lastStreamingBarTime.HasValue && roundedTime != lastStreamingBarTime.Value)
+        if (_currentStreamingBar != null && _currentStreamingBar.Timestamp == roundedTime)
         {
-            // Timestamp changed → previous bar is finalized, it's already in bars15Min
-            // The new bar is starting
+            // Same 15-min window — update in-place (IBKR sends cumulative state)
+            _currentStreamingBar.High  = Math.Max(_currentStreamingBar.High, high);
+            _currentStreamingBar.Low   = Math.Min(_currentStreamingBar.Low, low);
+            _currentStreamingBar.Close = close;
+            _currentStreamingBar.Volume = volume; // cumulative, not additive
+            return;
+        }
+
+        // New timestamp → seal the current in-progress bar (if any)
+        if (_currentStreamingBar != null)
+        {
+            bars15Min.Add(_currentStreamingBar);
+            AggregateStreamingToHour(_currentStreamingBar);
             new15MinBarCompleted = true;
-
-            // Also aggregate completed 15-min bar into 1-hour
-            var completedBar = bars15Min.Last();
-            AggregateStreamingToHour(completedBar);
         }
 
-        // Check if this is a new bar or update to existing
-        if (bars15Min.Count > 0 && bars15Min.Last().Timestamp == roundedTime)
+        // Start tracking the new in-progress bar
+        _currentStreamingBar = new Bar
         {
-            // Update existing bar in-place
-            var bar = bars15Min.Last();
-            bar.Open = open;
-            bar.High = high;
-            bar.Low = low;
-            bar.Close = close;
-            bar.Volume = volume;
-        }
-        else
-        {
-            // New bar (strictly newer than all existing)
-            bars15Min.Add(new Bar
-            {
-                Timestamp = roundedTime,
-                Open = open,
-                High = high,
-                Low = low,
-                Close = close,
-                Volume = volume,
-                Symbol = symbol
-            });
-        }
-
-        lastStreamingBarTime = roundedTime;
+            Timestamp = roundedTime,
+            Open = open,
+            High = high,
+            Low = low,
+            Close = close,
+            Volume = volume,
+            Symbol = symbol
+        };
     }
 
     private void AggregateStreamingToHour(Bar bar15m)

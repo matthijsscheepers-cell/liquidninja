@@ -168,8 +168,8 @@ public class LiveTradingEngine
             await Task.Delay(3000);
         }
 
-        // CONTFUT contract for polling (works reliably for 24/7 data)
-        var pollContract = new Contract
+        // CONTFUT contract for streaming (follows front-month automatically)
+        var streamingContract = new Contract
         {
             Symbol = asset,
             SecType = "CONTFUT",
@@ -177,19 +177,26 @@ public class LiveTradingEngine
             Exchange = asset == "MGC" ? "COMEX" : "CME"
         };
 
-        // 8. Handle reconnects
+        // 8. Wire streaming bar updates → aggregator
+        connector.OnStreamingBarUpdate += (_, t, o, h, l, c, v) =>
+            aggregator.UpdateStreamingBar(t, o, h, l, c, v);
+
+        // Subscribe to streaming bars (keepUpToDate=true) — delivers updates within seconds
+        connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
+        logger.LogStatus(DateTime.Now, "Streaming bars subscribed (keepUpToDate=true)...");
+
+        // 9. Handle reconnects — re-subscribe to streaming
         connector.OnReconnected += () =>
         {
-            logger.LogStatus(DateTime.Now, "IBKR reconnected - resuming polling...");
+            logger.LogStatus(DateTime.Now, "IBKR reconnected - re-subscribing to streaming bars...");
+            connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
         };
 
-        logger.LogStatus(DateTime.Now, "Live trading started (polling mode) - checking every 60s...");
+        logger.LogStatus(DateTime.Now, "Live trading started (streaming mode)...");
 
-        // 9. Main loop - poll for new bars every 90 seconds
+        // 10. Main loop — bar processing driven by streaming events
         isRunning = true;
-        var lastPoll = DateTime.MinValue;
         var lastReconcile = DateTime.Now;
-        var lastKnownBarTime = bars15m.Last().Timestamp;
 
         while (isRunning)
         {
@@ -197,13 +204,35 @@ public class LiveTradingEngine
 
             if (!connector.IsConnected) continue;
 
-            // Poll for new bars every 90 seconds (avoids IBKR pacing violations)
-            if ((DateTime.Now - lastPoll).TotalSeconds >= 90)
+            // Process a newly completed 15-min bar (flag auto-resets after read)
+            if (aggregator.New15MinBarCompleted)
             {
-                lastPoll = DateTime.Now;
-                var newBarTime = PollForNewBars(pollContract, lastKnownBarTime);
-                if (newBarTime.HasValue)
-                    lastKnownBarTime = newBarTime.Value;
+                barIndex = aggregator.Bars15Min.Count;
+                OnNew15MinBar();
+            }
+
+            // 5-minute limit expiry: if price hasn't returned to EMA within 5 min, cancel the stale entry.
+            // EMA taps are fast — if it hasn't filled in 5 min the setup is gone.
+            // BAR_EXPIRED at the next bar close is the safety net for any edge cases.
+            if (openPosition != null && !_entryConfirmed && entryOrderId != null &&
+                (DateTime.Now - _entryOrderPlacedAt).TotalMinutes >= 5)
+            {
+                var expireNow = DateTime.Now;
+                logger.LogStatus(expireNow, $"LIMIT_EXPIRED: entry #{entryOrderId} cancelled — price did not return to EMA within 5 minutes");
+                logger.LogExit(expireNow, openPosition, openPosition.EntryPrice, 0m, "LIMIT_EXPIRED");
+
+                if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+                if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+
+                if (strategy is TTMSqueezePullbackStrategy ttmExpired)
+                    ttmExpired.SetLastExitBar(barIndex);
+
+                openPosition = null;
+                entryOrderId = null;
+                stopOrderId = null;
+                targetOrderId = null;
+                _entryConfirmed = false;
             }
 
             // Position reconciliation every 60 seconds
@@ -251,58 +280,6 @@ public class LiveTradingEngine
         Console.WriteLine($"  Log: {logger?.LogPath ?? "N/A"}");
     }
 
-    /// <summary>
-    /// Poll IBKR for the latest 15-min bars and check if any are new
-    /// </summary>
-    private DateTime? PollForNewBars(Contract pollContract, DateTime lastKnownBarTime)
-    {
-        if (!connector.IsConnected) return null;
-
-        try
-        {
-            connector.RequestHistoricalBarsDirect(asset, pollContract, "14400 S", "15 mins", tag: "_poll");
-            var rawBars = connector.GetHistoricalBars(asset, timeoutSeconds: 15, tag: "_poll");
-
-            if (rawBars == null || rawBars.Count == 0) return null;
-
-            logger.LogStatus(DateTime.Now, $"Poll got {rawBars.Count} bars: [{rawBars.First().Time:yyyy-MM-dd HH:mm} ... {rawBars.Last().Time:yyyy-MM-dd HH:mm}], lastKnown={lastKnownBarTime:yyyy-MM-dd HH:mm}");
-
-            DateTime? latestNewBarTime = null;
-
-            foreach (var hb in rawBars)
-            {
-                if (hb.Time <= lastKnownBarTime) continue;
-
-                // This is a new bar we haven't seen yet
-                var bar = new Bar
-                {
-                    Timestamp = hb.Time, Open = hb.Open, High = hb.High,
-                    Low = hb.Low, Close = hb.Close, Volume = hb.Volume, Symbol = asset
-                };
-
-                // Add to aggregator's 15-min list
-                aggregator.UpdateStreamingBar(hb.Time, hb.Open, hb.High, hb.Low, hb.Close, hb.Volume);
-                latestNewBarTime = hb.Time;
-            }
-
-            if (latestNewBarTime.HasValue)
-            {
-                // New bars found — recalculate indicators and run strategy
-                barIndex = aggregator.Bars15Min.Count;
-                var lastBar = aggregator.Bars15Min.Last();
-                logger.LogStatus(DateTime.Now, $"New bar: {lastBar.Timestamp:yyyy-MM-dd HH:mm} Close=${lastBar.Close:F2} (total: {aggregator.Bars15Min.Count} 15m, {aggregator.Bars1Hour.Count} 1h)");
-                OnNew15MinBar();
-            }
-
-            return latestNewBarTime;
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(DateTime.Now, $"Poll error: {ex.Message}");
-            return null;
-        }
-    }
-
     private void OnNew15MinBar()
     {
         var bars15m = aggregator.Bars15Min;
@@ -310,12 +287,33 @@ public class LiveTradingEngine
 
         if (bars15m.Count < 50) return;
 
+        var lastBar = bars15m.Last();
+        var now = lastBar.Timestamp;
+
+        // BAR_EXPIRED: when a new bar fires, cancel any unconfirmed limit entry from the prior bar.
+        // The price did not return to the EMA level in time — the setup is stale.
+        if (openPosition != null && !_entryConfirmed && entryOrderId != null)
+        {
+            logger.LogStatus(now, $"BAR_EXPIRED: entry #{entryOrderId} cancelled — price did not return to EMA in the prior bar");
+            logger.LogExit(now, openPosition, openPosition.EntryPrice, 0m, "BAR_EXPIRED");
+
+            if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+            if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+            if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+
+            if (strategy is TTMSqueezePullbackStrategy ttmExpired)
+                ttmExpired.SetLastExitBar(barIndex);
+
+            openPosition = null;
+            entryOrderId = null;
+            stopOrderId = null;
+            targetOrderId = null;
+            _entryConfirmed = false;
+        }
+
         // Recalculate indicators (safe - skips existing via ContainsKey)
         IndicatorHelper.AddAllIndicators(bars15m);
         IndicatorHelper.AddAllIndicators(bars1h);
-
-        var lastBar = bars15m.Last();
-        var now = lastBar.Timestamp;
 
         logger.LogBar(now, bars15m.Count, bars1h.Count, lastBar.Close);
 
@@ -417,8 +415,8 @@ public class LiveTradingEngine
     {
         var now = DateTime.Now;
 
-        // Entry order filled
-        if (orderId == entryOrderId && status == "Filled" && filled > 0)
+        // Entry order filled — guard !_entryConfirmed so IBKR's duplicate "Filled" callbacks don't double-log
+        if (orderId == entryOrderId && status == "Filled" && filled > 0 && !_entryConfirmed)
         {
             logger.LogFill(now, orderId, avgPrice, filled);
             _entryConfirmed = true;
@@ -526,14 +524,14 @@ public class LiveTradingEngine
                 // Guard: if order was placed very recently, give it time to fill (avoid false positives
                 // when the reconcile timer happens to fire right after order placement).
                 var pendingSecs = (now - _entryOrderPlacedAt).TotalSeconds;
-                if (pendingSecs < 300) // 5-minute grace period
+                if (pendingSecs < 960) // 16-minute grace period (one full bar — BAR_EXPIRED handles stale entries sooner)
                 {
                     logger.LogStatus(now,
-                        $"RECONCILE: entry #{entryOrderId} pending ({pendingSecs:F0}s, grace=300s) — skipping RECONCILE_NO_FILL");
+                        $"RECONCILE: entry #{entryOrderId} pending ({pendingSecs:F0}s, grace=960s) — skipping RECONCILE_NO_FILL");
                     return;
                 }
 
-                // Order has been pending > 5 minutes with no fill → treat as stale.
+                // Order has been pending > 16 minutes with no fill — treat as stale.
                 logger.LogStatus(now,
                     $"RECONCILE: IBKR flat, entry for {openPosition.Direction} @ ${openPosition.EntryPrice:F2} unconfirmed — clearing stale position");
 

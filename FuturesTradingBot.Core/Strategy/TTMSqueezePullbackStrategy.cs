@@ -196,6 +196,9 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         if (isUptrend)
         {
             if (color == "red") return null;
+            // Yellow = histogram below zero but rising → counter-momentum long, poor edge
+            // MGC: 12.5% WR (-$1,927), MES: 7.7% WR (-$464) in 60-day backtest
+            if (color == "yellow") return null;
 
             var distLow = (current15m.Low - ema21) / atr;
             var distClose = (current15m.Close - ema21) / atr;
@@ -233,6 +236,9 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         else
         {
             if (color == "light_blue") return null;
+            // Dark_blue = histogram above zero but falling → counter-momentum short, poor edge
+            // MGC: 8.3% WR (-$2,921), MES: 15.4% WR (-$758) in 60-day backtest
+            if (color == "dark_blue") return null;
 
             var distHigh = (current15m.High - ema21) / atr;
             var distClose = (current15m.Close - ema21) / atr;
@@ -285,6 +291,8 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         if (isUptrend)
         {
             if (color == "red") return null;
+            // Yellow = histogram below zero but rising → counter-momentum long, poor edge
+            if (color == "yellow") return null;
 
             // Check pullback to 9 EMA
             var distLow = (current15m.Low - ema9) / atr;
@@ -330,6 +338,8 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         else // Downtrend
         {
             if (color == "light_blue") return null;
+            // Dark_blue = histogram above zero but falling → counter-momentum short, poor edge
+            if (color == "dark_blue") return null;
 
             var distHigh = (current15m.High - ema9) / atr;
             var distClose = (current15m.Close - ema9) / atr;

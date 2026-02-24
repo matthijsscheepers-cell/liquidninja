@@ -30,6 +30,10 @@ public class TradeLogger : IDisposable
 
     public void LogSignal(DateTime time, TradeSetup setup, bool taken, string reason)
     {
+        setup.Metadata.TryGetValue("histogram_color", out var histColor);
+        setup.Metadata.TryGetValue("distance_from_ema_atr", out var distEma);
+        setup.Metadata.TryGetValue("trend_strength_atr", out var trendStr);
+
         var entry = new
         {
             type = "SIGNAL",
@@ -41,6 +45,9 @@ public class TradeLogger : IDisposable
             stopLoss = setup.StopLoss,
             target = setup.Target,
             riskPerShare = setup.RiskPerShare,
+            histogramColor = histColor?.ToString(),
+            distanceEmaAtr = distEma is double d ? Math.Round(d, 3) : (object?)null,
+            trendStrengthAtr = trendStr is double t ? Math.Round(t, 3) : (object?)null,
             taken,
             reason
         };
