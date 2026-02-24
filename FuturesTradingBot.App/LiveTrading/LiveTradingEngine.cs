@@ -36,6 +36,7 @@ public class LiveTradingEngine
     private bool isRunning;
     private int barIndex;
     private DateTime _lastBarPoll = DateTime.MinValue;
+    private int _consecutivePollFailures = 0;
 
     // Stats
     private int totalTrades;
@@ -217,7 +218,9 @@ public class LiveTradingEngine
             if ((DateTime.Now - _lastBarPoll).TotalSeconds >= 90)
             {
                 _lastBarPoll = DateTime.Now;
-                await Task.Run(() => PollLatestBars());
+                bool pollOk = await Task.Run(() => PollLatestBars());
+                if (!pollOk)
+                    throw new Exception($"IBKR data feed lost ({_consecutivePollFailures} consecutive poll timeouts) — auto-restart triggered");
             }
 
             // Process a newly completed 15-min bar (flag auto-resets after read)
@@ -767,8 +770,9 @@ public class LiveTradingEngine
     /// Polling fallback: requests the last 2 hours of 15-min bars and feeds any new
     /// completed bars through the aggregator. Handles the case where IBKR Gateway
     /// doesn't send historicalDataUpdate callbacks for 15-min bars.
+    /// Returns false if consecutive timeouts indicate the data feed is dead (triggers restart).
     /// </summary>
-    private void PollLatestBars()
+    private bool PollLatestBars()
     {
         var contfutContract = new Contract
         {
@@ -781,10 +785,26 @@ public class LiveTradingEngine
         connector.RequestHistoricalBarsDirect(asset, contfutContract, "7200 S", "15 mins", tag: "_poll");
         var rawBars = connector.GetHistoricalBars(asset, timeoutSeconds: 15, tag: "_poll");
 
-        if (rawBars != null && rawBars.Count > 0)
+        if (rawBars != null)
         {
-            foreach (var hb in rawBars)
-                aggregator.UpdateStreamingBar(hb.Time, hb.Open, hb.High, hb.Low, hb.Close, hb.Volume);
+            _consecutivePollFailures = 0;
+            if (rawBars.Count > 0)
+            {
+                foreach (var hb in rawBars)
+                    aggregator.UpdateStreamingBar(hb.Time, hb.Open, hb.High, hb.Low, hb.Close, hb.Volume);
+            }
+        }
+        else // null = timeout — connection may be dead
+        {
+            _consecutivePollFailures++;
+            logger.LogStatus(DateTime.Now,
+                $"Poll timeout ({_consecutivePollFailures}/3) — IBKR data feed may be unavailable");
+            if (_consecutivePollFailures >= 3)
+            {
+                logger.LogError(DateTime.Now,
+                    $"IBKR data feed lost ({_consecutivePollFailures} consecutive poll timeouts) — triggering auto-restart");
+                return false;
+            }
         }
 
         // Force-seal the current in-progress bar if its 15-min window has elapsed.
@@ -793,6 +813,8 @@ public class LiveTradingEngine
         // before sealing so we always close with the latest available OHLCV.
         if (aggregator.CurrentBarEndTime.HasValue && DateTime.Now >= aggregator.CurrentBarEndTime.Value)
             aggregator.ForceCompleteCurrentBar();
+
+        return true;
     }
 
     private (List<Bar>? bars15m, List<Bar>? bars1h) FetchWarmupBars()
