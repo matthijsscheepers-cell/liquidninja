@@ -83,18 +83,23 @@ public class LiveTradingEngine
         if (!connector.Connect())
         {
             logger.LogError(DateTime.Now, "Failed to connect to IBKR!");
-            return;
+            throw new Exception("Failed to connect to IBKR — triggering restart");
         }
         Thread.Sleep(3000);
 
         // 2. Resolve front-month contract by asking IBKR directly (avoids hard-coded expiry dates)
+        // Wait briefly for the IBKR server connection to stabilise after the TCP handshake.
+        // Error 2110 ("connectivity broken") can appear immediately after connect if the Gateway
+        // is still re-establishing its own link to IB servers — give it up to 15 extra seconds.
         string exchange = asset == "MGC" ? "COMEX" : "CME";
+        connector.WaitForHmds(timeoutSeconds: 15);
+
         var resolved = connector.ResolveFrontMonthContract(asset, "FUT", exchange);
         if (resolved == null)
         {
             logger.LogError(DateTime.Now, $"Could not resolve front-month contract for {asset} — cannot trade safely. Exiting.");
             connector.Disconnect();
-            return;
+            throw new Exception($"Could not resolve front-month contract for {asset} — triggering restart");
         }
         contract = resolved;
         logger.LogStatus(DateTime.Now,
