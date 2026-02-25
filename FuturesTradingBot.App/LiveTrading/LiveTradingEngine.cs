@@ -37,6 +37,7 @@ public class LiveTradingEngine
     private int barIndex;
     private DateTime _lastBarPoll = DateTime.MinValue;
     private int _consecutivePollFailures = 0;
+    private DateTime _lastConnectedAt = DateTime.Now; // track last time socket was alive
 
     // Stats
     private int totalTrades;
@@ -219,7 +220,17 @@ public class LiveTradingEngine
         {
             await Task.Delay(5000);
 
-            if (!connector.IsConnected) continue;
+            if (!connector.IsConnected)
+            {
+                // If socket has been dead for > 5 minutes, auto-restart (reconnect loop won't help)
+                if ((DateTime.Now - _lastConnectedAt).TotalMinutes >= 5)
+                {
+                    logger.LogError(DateTime.Now, "IBKR socket disconnected for 5+ minutes — triggering auto-restart");
+                    throw new Exception("IBKR socket disconnected for 5+ minutes — auto-restart triggered");
+                }
+                continue;
+            }
+            _lastConnectedAt = DateTime.Now; // reset disconnect timer
 
             // Polling fallback: historicalDataUpdate doesn't fire reliably for 15-min bars
             // on IBKR Gateway — poll every 90 seconds to detect new completed bars.
