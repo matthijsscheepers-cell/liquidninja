@@ -194,11 +194,14 @@ public class LiveTradingEngine
         connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
         logger.LogStatus(DateTime.Now, "Streaming bars subscribed (keepUpToDate=true)...");
 
-        // 9. Handle reconnects — re-subscribe to streaming
+        // 9. Handle reconnects — re-subscribe to streaming and immediately re-check positions
+        // so any fills that arrived during the outage are confirmed before LIMIT_EXPIRED fires.
         connector.OnReconnected += () =>
         {
             logger.LogStatus(DateTime.Now, "IBKR reconnected - re-subscribing to streaming bars...");
             connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
+            _positionSeenInReconcile = false;
+            connector.RequestPositions();
         };
 
         logger.LogStatus(DateTime.Now, "Live trading started (streaming mode)...");
@@ -607,7 +610,17 @@ public class LiveTradingEngine
                 targetOrderId = null;
                 _entryConfirmed = false;
             }
-            // else: sign matches — position is as expected, nothing to do
+            else if (!_entryConfirmed)
+            {
+                // IBKR has a matching position but we never received the fill callback.
+                // This happens when a fill arrives during a reconnect. Confirm now so
+                // LIMIT_EXPIRED / BAR_EXPIRED don't cancel what is actually an open trade.
+                _entryConfirmed = true;
+                logger.LogFill(now, entryOrderId!.Value, openPosition.EntryPrice, 1m);
+                logger.LogStatus(now,
+                    $"RECONCILE: confirmed {openPosition.Direction} fill for entry #{entryOrderId} via position check (fill callback lost during reconnect)");
+            }
+            // else: sign matches and fill confirmed — position is as expected, nothing to do
         }
     }
 
