@@ -70,7 +70,7 @@ public class ConsistencyChecker
         dailyProfits[day] += profit;
         totalProfit += profit;
 
-        if (profit > 0 && totalProfit > 0)
+        if (profit > 0 && totalProfit >= 500m) // only warn once the rule is actually active
         {
             var todayPercentage = (dailyProfits[day] / totalProfit) * 100m;
 
