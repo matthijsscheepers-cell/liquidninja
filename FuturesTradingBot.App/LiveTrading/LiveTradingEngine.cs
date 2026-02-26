@@ -30,6 +30,7 @@ public class LiveTradingEngine
     private int? stopOrderId;
     private int? targetOrderId;
     private bool _entryConfirmed;     // true once IBKR confirms the entry LMT was filled
+    private bool _eodFlattenDone;     // true after EOD flatten fired today — blocks new entries
     private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
     private DateTime _entryOrderPlacedAt; // when the current bracket was submitted (for grace-period protection)
     private decimal currentBalance;
@@ -247,6 +248,9 @@ public class LiveTradingEngine
         // 10. Main loop — bar processing driven by streaming events
         isRunning = true;
         var lastReconcile = DateTime.Now;
+        // EOD flatten: prop firm rules — no overnight/weekend positions.
+        // Close all positions and cancel pending orders by 21:50 CET (5 min before 21:55 deadline).
+        var eodCutoff = new TimeOnly(21, 50, 0);
 
         while (isRunning)
         {
@@ -276,6 +280,45 @@ public class LiveTradingEngine
                     throw new Exception($"IBKR data feed lost ({_consecutivePollFailures} consecutive poll timeouts) — auto-restart triggered");
             }
 
+            // EOD flatten: close all positions before prop firm overnight/weekend deadline
+            var timeNow = TimeOnly.FromDateTime(DateTime.Now);
+            var dayNow  = DateTime.Now.DayOfWeek;
+            // Reset flag each new trading day (after midnight)
+            if (timeNow < new TimeOnly(6, 0, 0)) _eodFlattenDone = false;
+            // Trigger at cutoff if not yet done (also covers Friday = no weekend positions)
+            bool isWeekend = dayNow == DayOfWeek.Saturday || dayNow == DayOfWeek.Sunday;
+            bool pastCutoff = timeNow >= eodCutoff;
+            if ((pastCutoff || isWeekend) && !_eodFlattenDone)
+            {
+                _eodFlattenDone = true;
+                if (entryOrderId.HasValue || openPosition != null)
+                {
+                    logger.LogStatus(DateTime.Now, $"EOD_FLATTEN: market close approaching ({eodCutoff}) — cancelling orders and closing position");
+
+                    if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+                    if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                    if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+
+                    if (openPosition != null && _entryConfirmed)
+                    {
+                        string exitAction = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
+                        connector.PlaceMarketOrder(contract, exitAction, openPosition.Contracts);
+                        await Task.Delay(3000); // wait for fill callback
+                        logger.LogStatus(DateTime.Now, $"EOD_FLATTEN: market order placed to close {openPosition.Direction} position");
+                    }
+
+                    if (strategy is TTMSqueezePullbackStrategy ttmEod)
+                        ttmEod.SetLastExitBar(barIndex);
+
+                    openPosition = null;
+                    entryOrderId = null;
+                    stopOrderId = null;
+                    targetOrderId = null;
+                    _entryConfirmed = false;
+                }
+            }
+
+            // Block new entries after EOD cutoff (including weekends)
             // Process a newly completed 15-min bar (flag auto-resets after read)
             if (aggregator.New15MinBarCompleted)
             {
@@ -413,7 +456,7 @@ public class LiveTradingEngine
         }
 
         // Check for new entry if no position and no pending entry
-        if (openPosition == null && entryOrderId == null)
+        if (openPosition == null && entryOrderId == null && !_eodFlattenDone)
         {
             var current1h = bars1h.LastOrDefault(b => b.Timestamp <= now);
             if (current1h == null) return;
