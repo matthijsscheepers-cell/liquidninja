@@ -319,6 +319,17 @@ public partial class IbkrConnector : EWrapper
     public event Action<string, int>? OnPositionUpdate; // symbol, qty
     public event Action? OnPositionEnd;                  // fired when all positions have been reported
     public event Action? OnReconnected; // fired when IBKR connection is restored
+    public event Action<int, string>? OnOpenOrder;       // orderId, symbol — fired for each open order at startup
+    public event Action? OnOpenOrderEnd;                 // fired when all open orders have been reported
+
+    /// <summary>
+    /// Request all open orders for this account (fires OnOpenOrder per order, then OnOpenOrderEnd)
+    /// </summary>
+    public void RequestAllOpenOrders()
+    {
+        if (!clientSocket.IsConnected()) return;
+        clientSocket.reqAllOpenOrders();
+    }
 
     /// <summary>
     /// Place a bracket order: LMT entry + STP stop + LMT target

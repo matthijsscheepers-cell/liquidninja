@@ -100,6 +100,7 @@ public class LiveTradingEngine
         {
             logger.LogError(DateTime.Now, $"Could not resolve front-month contract for {asset} — cannot trade safely. Exiting.");
             connector.Disconnect();
+            await Task.Delay(5000); // let socket fully close before restart creates a new connection
             throw new Exception($"Could not resolve front-month contract for {asset} — triggering restart");
         }
         contract = resolved;
@@ -183,6 +184,37 @@ public class LiveTradingEngine
             await Task.Delay(3000);
         }
 
+        // 8b. Cancel any orphan GTC orders for this asset left over from previous sessions.
+        // Must run AFTER state restoration so we can exclude the current position's live orders.
+        {
+            var orphanIds = new List<int>();
+            var tcsOrders = new TaskCompletionSource<bool>();
+
+            // IDs that belong to the current restored position — do NOT cancel these
+            var keepIds = new HashSet<int>();
+            if (entryOrderId.HasValue)  keepIds.Add(entryOrderId.Value);
+            if (stopOrderId.HasValue)   keepIds.Add(stopOrderId.Value);
+            if (targetOrderId.HasValue) keepIds.Add(targetOrderId.Value);
+
+            connector.OnOpenOrder += (orderId, symbol) =>
+            {
+                if (symbol.Equals(asset, StringComparison.OrdinalIgnoreCase) && !keepIds.Contains(orderId))
+                    orphanIds.Add(orderId);
+            };
+            connector.OnOpenOrderEnd += () => tcsOrders.TrySetResult(true);
+
+            connector.RequestAllOpenOrders();
+            await Task.WhenAny(tcsOrders.Task, Task.Delay(3000)); // 3s timeout
+
+            if (orphanIds.Count > 0)
+            {
+                logger.LogStatus(DateTime.Now, $"Cancelling {orphanIds.Count} orphan GTC order(s) from previous session: [{string.Join(", ", orphanIds)}]");
+                foreach (var id in orphanIds)
+                    connector.CancelOrder(id);
+                await Task.Delay(500); // let cancellations process
+            }
+        }
+
         // CONTFUT contract for streaming (follows front-month automatically)
         var streamingContract = new Contract
         {
@@ -226,6 +258,8 @@ public class LiveTradingEngine
                 if ((DateTime.Now - _lastConnectedAt).TotalMinutes >= 5)
                 {
                     logger.LogError(DateTime.Now, "IBKR socket disconnected for 5+ minutes — triggering auto-restart");
+                    connector.Disconnect();
+                    await Task.Delay(5000);
                     throw new Exception("IBKR socket disconnected for 5+ minutes — auto-restart triggered");
                 }
                 continue;
@@ -386,6 +420,35 @@ public class LiveTradingEngine
 
             var setup = strategy.CheckEntry(bars15m, bars1h, "LIVE", 85m);
 
+            if (setup == null && bars15m.Count >= 2 && bars1h.Count >= 3)
+            {
+                // Debug: log indicator snapshot so we can diagnose why no signal
+                static decimal? GetMeta(Bar b, string key) =>
+                    b.Metadata != null && b.Metadata.TryGetValue(key, out var v) && v is decimal d ? d : null;
+
+                var d15 = bars15m[^1];
+                var d1h = bars1h[^2];
+                var ema1h  = GetMeta(d1h, "ema_21");
+                var atr1h  = GetMeta(d1h, "atr_20");
+                var ema15  = GetMeta(d15, "ema_21");
+                var atr15  = GetMeta(d15, "atr_20");
+                var mom15  = GetMeta(d15, "ttm_momentum");
+                var pmom15 = GetMeta(bars15m[^2], "ttm_momentum");
+                string color = (mom15.HasValue && pmom15.HasValue)
+                    ? FuturesTradingBot.Core.Indicators.TTMMomentum.GetHistogramColor(mom15, pmom15)
+                    : "n/a";
+                bool uptrend = ema1h.HasValue && d1h.Close > ema1h.Value;
+                decimal dist = (ema1h.HasValue && atr1h.HasValue && atr1h.Value != 0)
+                    ? Math.Abs(d1h.Close - ema1h.Value) / atr1h.Value
+                    : -1;
+                decimal pullDist = (ema15.HasValue && atr15.HasValue && atr15.Value != 0)
+                    ? Math.Abs(d15.Close - ema15.Value) / atr15.Value
+                    : -1;
+                logger.LogStatus(now,
+                    $"NO_SIGNAL: 1h close={d1h.Close:F2} ema21={ema1h:F2} trend={(uptrend ? "UP" : "DN")} dist={dist:F2}ATR | " +
+                    $"15m close={d15.Close:F2} ema21={ema15:F2} pullDist={pullDist:F2}ATR mom_color={color}");
+            }
+
             if (setup != null && setup.IsValid())
             {
                 var decision = riskManager.EvaluateTrade(setup, now, currentBalance);
@@ -543,6 +606,10 @@ public class LiveTradingEngine
 
                 logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {openPosition.Direction} open @ ${openPosition.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
                 logger.LogExit(now, openPosition, lastClose, pnl, "RECONCILE");
+
+                // Cancel any orphan GTC stop/target orders still sitting in TWS
+                if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
 
                 // Update stats
                 totalTrades++;

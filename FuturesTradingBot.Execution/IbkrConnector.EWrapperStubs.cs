@@ -227,8 +227,9 @@ public partial class IbkrConnector
         {
             orderTracking[orderId].Status = orderState.Status;
         }
+        OnOpenOrder?.Invoke(orderId, contract.Symbol);
     }
-    public void openOrderEnd() { }
+    public void openOrderEnd() { OnOpenOrderEnd?.Invoke(); }
     public void orderBound(long orderId, int apiClientId, int apiOrderId) { }
     public void updateAccountValue(string key, string value, string currency, string accountName) { }
     public void updatePortfolio(Contract contract, double position, double marketPrice, double marketValue, double averageCost, double unrealizedPNL, double realizedPNL, string accountName) { }
