@@ -416,6 +416,85 @@ public partial class IbkrConnector : EWrapper
     }
 
     /// <summary>
+    /// Place a bracket order with a MARKET entry: MKT entry + STP stop + LMT target.
+    /// Use when price is already at the EMA — fills immediately at current market price.
+    /// Returns the parent (entry) order ID.
+    /// </summary>
+    public int PlaceMarketBracketOrder(
+        Contract contract,
+        SignalDirection direction,
+        decimal stopPrice,
+        decimal targetPrice,
+        int quantity = 1)
+    {
+        if (!clientSocket.IsConnected())
+        {
+            Console.WriteLine("Not connected - cannot place order!");
+            return -1;
+        }
+
+        int parentId = nextOrderId++;
+        int stopId   = nextOrderId++;
+        int targetId = nextOrderId++;
+
+        string action     = direction == SignalDirection.LONG ? "BUY"  : "SELL";
+        string exitAction = direction == SignalDirection.LONG ? "SELL" : "BUY";
+        string ocaGroup   = $"LIQUIDNINJA_{parentId}";
+
+        // Parent order: MKT — fills immediately at current market price
+        var parentOrder = new Order
+        {
+            OrderId       = parentId,
+            Action        = action,
+            OrderType     = "MKT",
+            TotalQuantity = quantity,
+            Transmit      = false,
+            Tif           = "DAY"
+        };
+
+        var stopOrder = new Order
+        {
+            OrderId       = stopId,
+            Action        = exitAction,
+            OrderType     = "STP",
+            TotalQuantity = quantity,
+            AuxPrice      = (double)stopPrice,
+            ParentId      = parentId,
+            OcaGroup      = ocaGroup,
+            OcaType       = 1,
+            Transmit      = false,
+            Tif           = "GTC"
+        };
+
+        var targetOrder = new Order
+        {
+            OrderId       = targetId,
+            Action        = exitAction,
+            OrderType     = "LMT",
+            TotalQuantity = quantity,
+            LmtPrice      = (double)targetPrice,
+            ParentId      = parentId,
+            OcaGroup      = ocaGroup,
+            OcaType       = 1,
+            Transmit      = true,
+            Tif           = "GTC"
+        };
+
+        orderTracking[parentId] = new OrderInfo { OrderId = parentId, Type = "ENTRY", Status = "PendingSubmit" };
+        orderTracking[stopId]   = new OrderInfo { OrderId = stopId,   Type = "STOP",   Status = "PendingSubmit", ParentId = parentId };
+        orderTracking[targetId] = new OrderInfo { OrderId = targetId, Type = "TARGET", Status = "PendingSubmit", ParentId = parentId };
+
+        Console.WriteLine($"📤 Placing MARKET bracket #{parentId}: {action} {quantity}x {contract.Symbol}");
+        Console.WriteLine($"   Entry: MKT | Stop: ${stopPrice:F2} (STP) | Target: ${targetPrice:F2} (LMT)");
+
+        clientSocket.placeOrder(parentId, contract, parentOrder);
+        clientSocket.placeOrder(stopId,   contract, stopOrder);
+        clientSocket.placeOrder(targetId, contract, targetOrder);
+
+        return parentId;
+    }
+
+    /// <summary>
     /// Modify an existing stop order price
     /// </summary>
     public void ModifyStopOrder(int orderId, Contract contract, string action, decimal newStopPrice, int quantity)

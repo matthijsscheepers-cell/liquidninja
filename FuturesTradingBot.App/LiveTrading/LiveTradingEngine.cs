@@ -33,8 +33,9 @@ public class LiveTradingEngine
     private bool _eodFlattenDone;     // true after EOD flatten fired today — blocks new entries
     private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
     private DateTime _entryOrderPlacedAt; // when the current bracket was submitted (for grace-period protection)
-    private TradeSetup? _intrabarWatch;   // pending signal: place order the moment price touches EMA intrabar
+    private TradeSetup? _intrabarWatch;   // pending signal: place order when forming bar touches EMA zone
     private int _intrabarWatchContracts;  // contracts approved for the pending intrabar watch
+    private decimal _intrabarWatchAtr;    // ATR at watch-set time — for 0.5/0.1 ATR thresholds
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
@@ -228,30 +229,56 @@ public class LiveTradingEngine
             Exchange = asset == "MGC" ? "COMEX" : "CME"
         };
 
-        // 8. Wire streaming bar updates → aggregator + intrabar EMA watch
+        // 8. Wire streaming bar updates → aggregator + forming-bar EMA scan
         connector.OnStreamingBarUpdate += (_, t, o, h, l, c, v) =>
         {
             aggregator.UpdateStreamingBar(t, o, h, l, c, v);
 
-            // Intrabar EMA watch: fire the moment streaming price touches the EMA level.
-            // This fixes the backtest vs. live discrepancy where the signal bar's low touches
-            // EMA (backtest fills there) but the next-bar limit order misses the move.
+            // Forming-bar EMA scan (runs every ~5 sec):
+            //   Step 1 — bar_low ≤ EMA + 0.5 ATR  (LONG)  or  bar_high ≥ EMA - 0.5 ATR (SHORT)
+            //            → EMA zone has been touched at some point during this bar
+            //   Step 2 — check current offer (≈ streaming close):
+            //            offer ≤ EMA + 0.1 ATR  → MARKET ORDER  (price is right at EMA now)
+            //            offer > EMA            → LIMIT ORDER at EMA  (price bounced, wait for return)
+            // This matches the reference bot behaviour and the backtest fill assumption.
             if (_intrabarWatch != null && openPosition == null && entryOrderId == null && !_eodFlattenDone)
             {
-                decimal price = (decimal)c;
-                bool touched = _intrabarWatch.Direction == SignalDirection.LONG
-                    ? price <= _intrabarWatch.EntryPrice
-                    : price >= _intrabarWatch.EntryPrice;
+                decimal formingHigh  = (decimal)h;
+                decimal formingLow   = (decimal)l;
+                decimal currentOffer = (decimal)c;   // last traded price ≈ offer in futures
+                decimal ema          = _intrabarWatch.EntryPrice;
+                decimal atr          = _intrabarWatchAtr;
 
-                if (touched)
+                // Step 1: has the forming bar's low/high entered the EMA zone?
+                bool emaTouched = _intrabarWatch.Direction == SignalDirection.LONG
+                    ? formingLow  <= ema + 0.5m * atr
+                    : formingHigh >= ema - 0.5m * atr;
+
+                if (emaTouched)
                 {
-                    var watch = _intrabarWatch;
+                    var watch         = _intrabarWatch;
                     var watchContracts = _intrabarWatchContracts;
-                    _intrabarWatch = null;
-                    var triggerTime = DateTime.Now;
-                    logger.LogStatus(triggerTime,
-                        $"INTRABAR_TRIGGER: {watch.Direction} price {price:F2} touched EMA {watch.EntryPrice:F2} — placing order now");
-                    PlaceEntryOrder(watch, watchContracts, triggerTime);
+                    _intrabarWatch    = null;   // clear before placing to prevent re-entry
+                    var triggerTime   = DateTime.Now;
+
+                    // Step 2: market if price is right at EMA, limit if it bounced above
+                    bool priceAtEma = watch.Direction == SignalDirection.LONG
+                        ? currentOffer <= ema + 0.1m * atr
+                        : currentOffer >= ema - 0.1m * atr;
+
+                    if (priceAtEma)
+                    {
+                        logger.LogStatus(triggerTime,
+                            $"INTRABAR_MARKET: {watch.Direction} offer {currentOffer:F2} at EMA {ema:F2} (±0.1 ATR) — market order");
+                        PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: true);
+                    }
+                    else
+                    {
+                        logger.LogStatus(triggerTime,
+                            $"INTRABAR_LIMIT: {watch.Direction} bar touched EMA zone (low {formingLow:F2} / high {formingHigh:F2}) " +
+                            $"but offer {currentOffer:F2} above EMA {ema:F2} — limit order");
+                        PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: false);
+                    }
                 }
             }
         };
@@ -489,65 +516,92 @@ public class LiveTradingEngine
             }
         }
 
-        // Check for new entry if no position and no pending entry
-        if (openPosition == null && entryOrderId == null && !_eodFlattenDone)
+        // Check for new entry if no position and no pending entry or watch
+        if (openPosition == null && entryOrderId == null && _intrabarWatch == null && !_eodFlattenDone)
         {
             var current1h = bars1h.LastOrDefault(b => b.Timestamp <= now);
             if (current1h == null) return;
 
+            static decimal? GetMeta(Bar b, string key) =>
+                b.Metadata != null && b.Metadata.TryGetValue(key, out var v) && v is decimal d ? d : null;
+
+            var curBar = bars15m[^1];
+            var ema15  = GetMeta(curBar, "ema_21");
+            var atr15  = GetMeta(curBar, "atr_20");
+
+            // ── Path A: bar closed at EMA → signal fires via normal CheckEntry ──
             var setup = strategy.CheckEntry(bars15m, bars1h, "LIVE", 85m);
-
-            if (setup == null && bars15m.Count >= 2 && bars1h.Count >= 3)
-            {
-                // Debug: log indicator snapshot so we can diagnose why no signal
-                static decimal? GetMeta(Bar b, string key) =>
-                    b.Metadata != null && b.Metadata.TryGetValue(key, out var v) && v is decimal d ? d : null;
-
-                var d15 = bars15m[^1];
-                var d1h = bars1h[^2];
-                var ema1h  = GetMeta(d1h, "ema_21");
-                var atr1h  = GetMeta(d1h, "atr_20");
-                var ema15  = GetMeta(d15, "ema_21");
-                var atr15  = GetMeta(d15, "atr_20");
-                var mom15  = GetMeta(d15, "ttm_momentum");
-                var pmom15 = GetMeta(bars15m[^2], "ttm_momentum");
-                string color = (mom15.HasValue && pmom15.HasValue)
-                    ? FuturesTradingBot.Core.Indicators.TTMMomentum.GetHistogramColor(mom15, pmom15)
-                    : "n/a";
-                bool uptrend = ema1h.HasValue && d1h.Close > ema1h.Value;
-                decimal dist = (ema1h.HasValue && atr1h.HasValue && atr1h.Value != 0)
-                    ? Math.Abs(d1h.Close - ema1h.Value) / atr1h.Value
-                    : -1;
-                decimal pullDist = (ema15.HasValue && atr15.HasValue && atr15.Value != 0)
-                    ? Math.Abs(d15.Close - ema15.Value) / atr15.Value
-                    : -1;
-                logger.LogStatus(now,
-                    $"NO_SIGNAL: 1h close={d1h.Close:F2} ema21={ema1h:F2} trend={(uptrend ? "UP" : "DN")} dist={dist:F2}ATR | " +
-                    $"15m close={d15.Close:F2} ema21={ema15:F2} pullDist={pullDist:F2}ATR mom_color={color}");
-            }
 
             if (setup != null && setup.IsValid())
             {
                 var decision = riskManager.EvaluateTrade(setup, now, currentBalance);
-
                 if (decision.Approved)
                 {
-                    logger.LogSignal(now, setup, true, $"Approved: {decision.Contracts} contracts");
-
-                    // Set intrabar watch: the order is placed the moment streaming price touches EMA.
-                    // This matches the backtest fill assumption (entry on the signal bar when price
-                    // is at EMA) rather than waiting for the next bar where price may have moved away.
-                    _intrabarWatch = setup;
+                    logger.LogSignal(now, setup, true, $"Approved: {decision.Contracts} contracts — intrabar watch active");
+                    _intrabarWatch         = setup;
                     _intrabarWatchContracts = decision.Contracts;
+                    _intrabarWatchAtr      = atr15 ?? 10m;
                 }
                 else
                 {
                     var reason = decision.BlockedBy?.Count > 0
                         ? string.Join("; ", decision.BlockedBy)
-                        : decision.Reasons?.Count > 0
-                            ? decision.Reasons[0]
-                            : "Unknown";
+                        : decision.Reasons?.Count > 0 ? decision.Reasons[0] : "Unknown";
                     logger.LogSignal(now, setup, false, reason);
+                }
+            }
+            // ── Path B: bar did NOT close at EMA, but other conditions may be met ──
+            // Create a synthetic bar with close = EMA21 to test pre-conditions without
+            // requiring the actual close to have been at EMA. This lets us watch the NEXT
+            // forming bar for an intrabar EMA touch even when the closed bar's close was above.
+            else if (ema15.HasValue && atr15.HasValue && bars15m.Count >= 2 && bars1h.Count >= 3)
+            {
+                var syntheticBar = new Bar
+                {
+                    Timestamp = curBar.Timestamp,
+                    Open      = curBar.Open,
+                    High      = curBar.High,
+                    Low       = Math.Min(curBar.Low, ema15.Value),
+                    Close     = ema15.Value,   // force close = EMA so the entry condition passes
+                    Volume    = curBar.Volume,
+                    Metadata  = new Dictionary<string, object?>()
+                };
+                var testBars = bars15m.Take(bars15m.Count - 1).ToList();
+                testBars.Add(syntheticBar);
+                IndicatorHelper.AddAllIndicators(testBars); // only computes the new synthetic bar
+
+                var preSetup = strategy.CheckEntry(testBars, bars1h, "LIVE", 85m);
+                if (preSetup != null && preSetup.IsValid())
+                {
+                    var preDecision = riskManager.EvaluateTrade(preSetup, now, currentBalance);
+                    if (preDecision.Approved)
+                    {
+                        logger.LogStatus(now,
+                            $"PRECON_WATCH: {preSetup.Direction} pre-conditions met, EMA {preSetup.EntryPrice:F2} — scanning forming bar");
+                        _intrabarWatch         = preSetup;
+                        _intrabarWatchContracts = preDecision.Contracts;
+                        _intrabarWatchAtr      = atr15.Value;
+                    }
+                }
+                else
+                {
+                    // Log why no signal (neither path A nor B fired)
+                    var d1h = bars1h[^2];
+                    var ema1h  = GetMeta(d1h, "ema_21");
+                    var atr1h  = GetMeta(d1h, "atr_20");
+                    var mom15  = GetMeta(curBar, "ttm_momentum");
+                    var pmom15 = GetMeta(bars15m[^2], "ttm_momentum");
+                    string color = (mom15.HasValue && pmom15.HasValue)
+                        ? FuturesTradingBot.Core.Indicators.TTMMomentum.GetHistogramColor(mom15, pmom15)
+                        : "n/a";
+                    bool uptrend = ema1h.HasValue && d1h.Close > ema1h.Value;
+                    decimal dist = (ema1h.HasValue && atr1h.HasValue && atr1h.Value != 0)
+                        ? Math.Abs(d1h.Close - ema1h.Value) / atr1h.Value : -1;
+                    decimal pullDist = (atr15.Value != 0)
+                        ? Math.Abs(curBar.Close - ema15.Value) / atr15.Value : -1;
+                    logger.LogStatus(now,
+                        $"NO_SIGNAL: 1h close={d1h.Close:F2} ema21={ema1h:F2} trend={(uptrend ? "UP" : "DN")} dist={dist:F2}ATR | " +
+                        $"15m close={curBar.Close:F2} ema21={ema15:F2} pullDist={pullDist:F2}ATR mom_color={color}");
                 }
             }
         }
@@ -620,40 +674,43 @@ public class LiveTradingEngine
         }
     }
 
-    private void PlaceEntryOrder(TradeSetup setup, int contracts, DateTime barTime)
+    private void PlaceEntryOrder(TradeSetup setup, int contracts, DateTime barTime, bool isMarket = false)
     {
         decimal roundedEntry  = RoundToTick(setup.EntryPrice);
         decimal roundedStop   = RoundToTick(setup.StopLoss);
         decimal roundedTarget = RoundToTick(setup.Target);
 
-        var parentId = connector.PlaceBracketOrder(
-            contract, setup.Direction, roundedEntry, roundedStop, roundedTarget, contracts);
+        int parentId = isMarket
+            ? connector.PlaceMarketBracketOrder(contract, setup.Direction, roundedStop, roundedTarget, contracts)
+            : connector.PlaceBracketOrder(contract, setup.Direction, roundedEntry, roundedStop, roundedTarget, contracts);
 
-        entryOrderId = parentId;
-        stopOrderId  = parentId + 1;
+        entryOrderId  = parentId;
+        stopOrderId   = parentId + 1;
         targetOrderId = parentId + 2;
         _entryOrderPlacedAt = DateTime.Now;
 
-        logger.LogOrder(barTime, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, contracts);
-        logger.LogOrder(barTime, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, contracts);
-        logger.LogOrder(barTime, parentId + 2, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "LMT", roundedTarget, contracts);
+        string entryAction = setup.Direction == SignalDirection.LONG ? "BUY"  : "SELL";
+        string exitAction  = setup.Direction == SignalDirection.LONG ? "SELL" : "BUY";
+        logger.LogOrder(barTime, parentId,     entryAction, isMarket ? "MKT" : "LMT", roundedEntry, contracts);
+        logger.LogOrder(barTime, parentId + 1, exitAction,  "STP", roundedStop,   contracts);
+        logger.LogOrder(barTime, parentId + 2, exitAction,  "LMT", roundedTarget, contracts);
 
         openPosition = new Position
         {
-            Asset = asset,
-            Direction = setup.Direction,
-            EntryPrice = roundedEntry,
-            StopLoss = roundedStop,
-            Target = roundedTarget,
-            Contracts = contracts,
+            Asset           = asset,
+            Direction       = setup.Direction,
+            EntryPrice      = roundedEntry,
+            StopLoss        = roundedStop,
+            Target          = roundedTarget,
+            Contracts       = contracts,
             RiskPerContract = setup.RiskPerShare * Multipliers.GetValueOrDefault(asset, 10m),
-            EntryTime = barTime,
-            EntryBar = barIndex,
-            EntryStrategy = setup.SetupType
+            EntryTime       = barTime,
+            EntryBar        = barIndex,
+            EntryStrategy   = setup.SetupType
         };
 
         if (strategy is TTMSqueezePullbackStrategy ttm)
-            ttm.SetLastExitBar(-999); // Reset cooldown
+            ttm.SetLastExitBar(-999);
     }
 
     // execDetails fires on every fill — more reliable than orderStatus for bracket child orders.
