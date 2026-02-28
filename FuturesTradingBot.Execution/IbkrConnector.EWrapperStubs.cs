@@ -38,6 +38,7 @@ public partial class IbkrConnector
     public void execDetails(int reqId, Contract contract, Execution execution)
     {
         Console.WriteLine($"📋 Exec: {execution.Side} {execution.Shares}x {contract.Symbol} @ ${execution.Price:F2} (order #{execution.OrderId})");
+        OnExecution?.Invoke(execution.OrderId, (decimal)execution.Price, (decimal)execution.Shares);
     }
     public void execDetailsEnd(int reqId) { }
     public void fundamentalData(int reqId, string data) { }

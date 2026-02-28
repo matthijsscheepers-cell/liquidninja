@@ -169,6 +169,7 @@ public class LiveTradingEngine
 
         // 7. Wire up order events (before state restore so reconcile callbacks work immediately)
         connector.OnOrderStatusChanged += HandleOrderStatus;
+        connector.OnExecution += HandleExecution;
         connector.OnPositionUpdate += HandlePositionUpdate;
         connector.OnPositionEnd += HandlePositionEnd;
 
@@ -614,6 +615,57 @@ public class LiveTradingEngine
         if (orderId == entryOrderId && (status == "Cancelled" || status == "Inactive"))
         {
             logger.LogStatus(now, $"Entry order #{orderId} {status}");
+            openPosition = null;
+            entryOrderId = null;
+            stopOrderId = null;
+            targetOrderId = null;
+            _entryConfirmed = false;
+        }
+    }
+
+    // execDetails fires on every fill — more reliable than orderStatus for bracket child orders.
+    // Used as primary exit detector; HandleOrderStatus is a secondary fallback.
+    private void HandleExecution(int orderId, decimal fillPrice, decimal qty)
+    {
+        var now = DateTime.Now;
+
+        // Entry fill
+        if (orderId == entryOrderId && qty > 0 && !_entryConfirmed)
+        {
+            logger.LogFill(now, orderId, fillPrice, qty);
+            _entryConfirmed = true;
+            if (openPosition != null)
+            {
+                openPosition.EntryPrice = fillPrice;
+                logger.LogStatus(now, $"Position opened (exec): {openPosition.Direction} {asset} {qty}x @ ${fillPrice:F2}");
+            }
+            return;
+        }
+
+        // Stop or target fill
+        if ((orderId == stopOrderId || orderId == targetOrderId) && qty > 0 && openPosition != null)
+        {
+            var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
+            decimal priceMove = openPosition.Direction == SignalDirection.LONG
+                ? fillPrice - openPosition.EntryPrice
+                : openPosition.EntryPrice - fillPrice;
+            decimal pnl = priceMove * multiplier * openPosition.Contracts;
+
+            string exitReason = orderId == stopOrderId ? "STOP" : "TARGET";
+            logger.LogFill(now, orderId, fillPrice, qty);
+            logger.LogExit(now, openPosition, fillPrice, pnl, exitReason);
+
+            totalTrades++;
+            totalPnL += pnl;
+            currentBalance += pnl;
+            if (pnl > 0) wins++;
+            else if (pnl < 0) losses++;
+
+            riskManager.RecordTradeResult(pnl, pnl > 0, now);
+
+            if (strategy is TTMSqueezePullbackStrategy ttm)
+                ttm.SetLastExitBar(barIndex);
+
             openPosition = null;
             entryOrderId = null;
             stopOrderId = null;

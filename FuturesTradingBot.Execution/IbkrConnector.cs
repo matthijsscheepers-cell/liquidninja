@@ -316,6 +316,7 @@ public partial class IbkrConnector : EWrapper
     private Dictionary<string, int> positionTracking = new(); // symbol → qty
 
     public event Action<int, string, decimal, decimal>? OnOrderStatusChanged; // orderId, status, filled, avgPrice
+    public event Action<int, decimal, decimal>? OnExecution;                 // orderId, fillPrice, qty — fires on every fill via execDetails
     public event Action<string, int>? OnPositionUpdate; // symbol, qty
     public event Action? OnPositionEnd;                  // fired when all positions have been reported
     public event Action? OnReconnected; // fired when IBKR connection is restored
