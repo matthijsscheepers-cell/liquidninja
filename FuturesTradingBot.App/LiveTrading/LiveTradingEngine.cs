@@ -33,6 +33,8 @@ public class LiveTradingEngine
     private bool _eodFlattenDone;     // true after EOD flatten fired today — blocks new entries
     private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
     private DateTime _entryOrderPlacedAt; // when the current bracket was submitted (for grace-period protection)
+    private TradeSetup? _intrabarWatch;   // pending signal: place order the moment price touches EMA intrabar
+    private int _intrabarWatchContracts;  // contracts approved for the pending intrabar watch
     private decimal currentBalance;
     private bool isRunning;
     private int barIndex;
@@ -226,9 +228,33 @@ public class LiveTradingEngine
             Exchange = asset == "MGC" ? "COMEX" : "CME"
         };
 
-        // 8. Wire streaming bar updates → aggregator
+        // 8. Wire streaming bar updates → aggregator + intrabar EMA watch
         connector.OnStreamingBarUpdate += (_, t, o, h, l, c, v) =>
+        {
             aggregator.UpdateStreamingBar(t, o, h, l, c, v);
+
+            // Intrabar EMA watch: fire the moment streaming price touches the EMA level.
+            // This fixes the backtest vs. live discrepancy where the signal bar's low touches
+            // EMA (backtest fills there) but the next-bar limit order misses the move.
+            if (_intrabarWatch != null && openPosition == null && entryOrderId == null && !_eodFlattenDone)
+            {
+                decimal price = (decimal)c;
+                bool touched = _intrabarWatch.Direction == SignalDirection.LONG
+                    ? price <= _intrabarWatch.EntryPrice
+                    : price >= _intrabarWatch.EntryPrice;
+
+                if (touched)
+                {
+                    var watch = _intrabarWatch;
+                    var watchContracts = _intrabarWatchContracts;
+                    _intrabarWatch = null;
+                    var triggerTime = DateTime.Now;
+                    logger.LogStatus(triggerTime,
+                        $"INTRABAR_TRIGGER: {watch.Direction} price {price:F2} touched EMA {watch.EntryPrice:F2} — placing order now");
+                    PlaceEntryOrder(watch, watchContracts, triggerTime);
+                }
+            }
+        };
 
         // Subscribe to streaming bars (keepUpToDate=true) — delivers updates within seconds
         connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
@@ -406,8 +432,15 @@ public class LiveTradingEngine
         var lastBar = bars15m.Last();
         var now = lastBar.Timestamp;
 
-        // BAR_EXPIRED: when a new bar fires, cancel any unconfirmed limit entry from the prior bar.
-        // The price did not return to the EMA level in time — the setup is stale.
+        // WATCH_EXPIRED: if last bar's intrabar watch never triggered, clear it.
+        if (_intrabarWatch != null && openPosition == null && entryOrderId == null)
+        {
+            logger.LogStatus(now,
+                $"WATCH_EXPIRED: {_intrabarWatch.Direction} EMA {_intrabarWatch.EntryPrice:F2} not touched in prior bar");
+            _intrabarWatch = null;
+        }
+
+        // BAR_EXPIRED: cancel any unconfirmed limit entry that was placed intrabar but not filled.
         if (openPosition != null && !_entryConfirmed && entryOrderId != null)
         {
             logger.LogStatus(now, $"BAR_EXPIRED: entry #{entryOrderId} cancelled — price did not return to EMA in the prior bar");
@@ -501,47 +534,11 @@ public class LiveTradingEngine
                 {
                     logger.LogSignal(now, setup, true, $"Approved: {decision.Contracts} contracts");
 
-                    // Round prices to contract minimum tick before placing (Error 110 prevention)
-                    decimal roundedEntry  = RoundToTick(setup.EntryPrice);
-                    decimal roundedStop   = RoundToTick(setup.StopLoss);
-                    decimal roundedTarget = RoundToTick(setup.Target);
-
-                    // Place bracket order on IBKR
-                    var parentId = connector.PlaceBracketOrder(
-                        contract,
-                        setup.Direction,
-                        roundedEntry,
-                        roundedStop,
-                        roundedTarget,
-                        decision.Contracts
-                    );
-
-                    entryOrderId = parentId;
-                    stopOrderId = parentId + 1;
-                    targetOrderId = parentId + 2;
-                    _entryOrderPlacedAt = DateTime.Now; // wall-clock time (not bar timestamp)
-
-                    logger.LogOrder(now, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, decision.Contracts);
-                    logger.LogOrder(now, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, decision.Contracts);
-                    logger.LogOrder(now, parentId + 2, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "LMT", roundedTarget, decision.Contracts);
-
-                    // Create position object (will be confirmed on fill)
-                    openPosition = new Position
-                    {
-                        Asset = asset,
-                        Direction = setup.Direction,
-                        EntryPrice = roundedEntry,
-                        StopLoss = roundedStop,
-                        Target = roundedTarget,
-                        Contracts = decision.Contracts,
-                        RiskPerContract = setup.RiskPerShare * Multipliers.GetValueOrDefault(asset, 10m),
-                        EntryTime = now,
-                        EntryBar = barIndex,
-                        EntryStrategy = setup.SetupType
-                    };
-
-                    if (strategy is TTMSqueezePullbackStrategy ttm)
-                        ttm.SetLastExitBar(-999); // Reset cooldown
+                    // Set intrabar watch: the order is placed the moment streaming price touches EMA.
+                    // This matches the backtest fill assumption (entry on the signal bar when price
+                    // is at EMA) rather than waiting for the next bar where price may have moved away.
+                    _intrabarWatch = setup;
+                    _intrabarWatchContracts = decision.Contracts;
                 }
                 else
                 {
@@ -621,6 +618,42 @@ public class LiveTradingEngine
             targetOrderId = null;
             _entryConfirmed = false;
         }
+    }
+
+    private void PlaceEntryOrder(TradeSetup setup, int contracts, DateTime barTime)
+    {
+        decimal roundedEntry  = RoundToTick(setup.EntryPrice);
+        decimal roundedStop   = RoundToTick(setup.StopLoss);
+        decimal roundedTarget = RoundToTick(setup.Target);
+
+        var parentId = connector.PlaceBracketOrder(
+            contract, setup.Direction, roundedEntry, roundedStop, roundedTarget, contracts);
+
+        entryOrderId = parentId;
+        stopOrderId  = parentId + 1;
+        targetOrderId = parentId + 2;
+        _entryOrderPlacedAt = DateTime.Now;
+
+        logger.LogOrder(barTime, parentId, setup.Direction == SignalDirection.LONG ? "BUY" : "SELL", "LMT", roundedEntry, contracts);
+        logger.LogOrder(barTime, parentId + 1, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "STP", roundedStop, contracts);
+        logger.LogOrder(barTime, parentId + 2, setup.Direction == SignalDirection.LONG ? "SELL" : "BUY", "LMT", roundedTarget, contracts);
+
+        openPosition = new Position
+        {
+            Asset = asset,
+            Direction = setup.Direction,
+            EntryPrice = roundedEntry,
+            StopLoss = roundedStop,
+            Target = roundedTarget,
+            Contracts = contracts,
+            RiskPerContract = setup.RiskPerShare * Multipliers.GetValueOrDefault(asset, 10m),
+            EntryTime = barTime,
+            EntryBar = barIndex,
+            EntryStrategy = setup.SetupType
+        };
+
+        if (strategy is TTMSqueezePullbackStrategy ttm)
+            ttm.SetLastExitBar(-999); // Reset cooldown
     }
 
     // execDetails fires on every fill — more reliable than orderStatus for bracket child orders.
