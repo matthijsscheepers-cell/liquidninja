@@ -438,6 +438,7 @@ BacktestResult RunFullAnalysis(string symbol, List<Bar> bars15m, List<Bar> bars1
 
     var paramTests = new (string Param, decimal[] Values)[]
     {
+        ("trend_strength",  new[] { 0.10m, 0.15m, 0.20m, 0.25m, 0.30m }),
         ("entry_tolerance", new[] { 0.8m, 1.0m, 1.2m, 1.4m }),
         ("stop_atr",        new[] { 1.3m, 1.5m, 1.7m }),
         ("target_atr",      new[] { 1.8m, 2.0m, 2.2m }),
@@ -446,8 +447,8 @@ BacktestResult RunFullAnalysis(string symbol, List<Bar> bars15m, List<Bar> bars1
     };
 
     var baselineDefault = symbol == "MGC"
-        ? new Dictionary<string, decimal> { {"entry_tolerance", 1.2m}, {"stop_atr", 1.5m}, {"target_atr", 2.0m}, {"trend_ride_threshold", 1.5m}, {"trend_ride_stop_atr", 1.0m} }
-        : new Dictionary<string, decimal> { {"entry_tolerance", 1.0m}, {"stop_atr", 1.5m}, {"target_atr", 2.0m}, {"trend_ride_threshold", 1.5m}, {"trend_ride_stop_atr", 1.0m} };
+        ? new Dictionary<string, decimal> { {"trend_strength", 0.30m}, {"entry_tolerance", 1.2m}, {"stop_atr", 1.5m}, {"target_atr", 2.0m}, {"trend_ride_threshold", 1.5m}, {"trend_ride_stop_atr", 1.0m} }
+        : new Dictionary<string, decimal> { {"trend_strength", 0.30m}, {"entry_tolerance", 1.0m}, {"stop_atr", 1.5m}, {"target_atr", 2.0m}, {"trend_ride_threshold", 1.5m}, {"trend_ride_stop_atr", 1.0m} };
 
     int stableCount = 0;
     int totalParams = paramTests.Length;

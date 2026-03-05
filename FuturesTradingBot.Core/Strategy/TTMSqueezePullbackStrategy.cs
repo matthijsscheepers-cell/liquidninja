@@ -46,7 +46,7 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
                     { "stop_atr", 1.5m },
                     { "target_atr", 2.0m },
                     { "breakeven_atr", 1.0m },
-                    { "trend_strength", 0.3m },
+                    { "trend_strength", 0.2m },  // sensitivity: 0.20 > 0.30 (+3.4% P&L, 50.8% WR)
                     { "cooldown_bars", 3 },
                     // Trend ride parameters (strong trend mode)
                     { "trend_ride_threshold", 1.5m },  // Activate when 1H is 1.5+ ATR from EMA
@@ -65,7 +65,7 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
                     { "stop_atr", 1.5m },
                     { "target_atr", 2.0m },
                     { "breakeven_atr", 1.0m },
-                    { "trend_strength", 0.3m },
+                    { "trend_strength", 0.15m }, // sensitivity: 0.15 > 0.30 (+6.2% P&L, WR stable)
                     { "cooldown_bars", 3 },
                     { "trend_ride_threshold", 1.5m },
                     { "trend_ride_tolerance", 0.8m },

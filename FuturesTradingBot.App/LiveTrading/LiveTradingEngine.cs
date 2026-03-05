@@ -334,9 +334,18 @@ public class LiveTradingEngine
             }
             _lastConnectedAt = DateTime.Now; // reset disconnect timer
 
+            // Bar-seal check: if the current forming bar's 15-min window has elapsed, trigger
+            // a poll immediately — don't wait for the regular 90s cycle.  This closes the gap
+            // where a poll fires at e.g. 10:14:30 and the next one wouldn't fire until 10:16:00,
+            // causing the 10:15 bar to be evaluated a full bar late.
+            // We add a 20s buffer so IBKR has time to include the freshly-completed bar.
+            bool barOverdue = aggregator.CurrentBarEndTime.HasValue &&
+                              DateTime.Now >= aggregator.CurrentBarEndTime.Value.AddSeconds(20) &&
+                              (DateTime.Now - _lastBarPoll).TotalSeconds >= 20;
+
             // Polling fallback: historicalDataUpdate doesn't fire reliably for 15-min bars
             // on IBKR Gateway — poll every 90 seconds to detect new completed bars.
-            if ((DateTime.Now - _lastBarPoll).TotalSeconds >= 90)
+            if (barOverdue || (DateTime.Now - _lastBarPoll).TotalSeconds >= 90)
             {
                 _lastBarPoll = DateTime.Now;
                 bool pollOk = await Task.Run(() => PollLatestBars());
