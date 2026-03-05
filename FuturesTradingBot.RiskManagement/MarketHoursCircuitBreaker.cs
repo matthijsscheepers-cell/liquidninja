@@ -34,38 +34,43 @@ public class MarketHoursCircuitBreaker
         };
     }
 
+    private static readonly TimeZoneInfo EasternZone =
+        TimeZoneInfo.FindSystemTimeZoneById(
+            OperatingSystem.IsWindows() ? "Eastern Standard Time" : "America/New_York");
+
+    private static TimeSpan ToEasternTimeOfDay(DateTime localTime)
+    {
+        var eastern = TimeZoneInfo.ConvertTime(localTime, EasternZone);
+        return eastern.TimeOfDay;
+    }
+
     /// <summary>
-    /// Can we trade at this time?
-    /// currentTime should be in US Eastern Time (as IBKR provides)
+    /// Can we trade at this time? Accepts any local DateTime — converts to ET internally.
     /// </summary>
     public bool CanTrade(DateTime currentTime)
     {
-        var timeOfDay = currentTime.TimeOfDay;
+        var etTimeOfDay = ToEasternTimeOfDay(currentTime);
 
         foreach (var window in blackoutWindows)
         {
-            if (timeOfDay >= window.Start && timeOfDay < window.End)
-            {
+            if (etTimeOfDay >= window.Start && etTimeOfDay < window.End)
                 return false;
-            }
         }
 
         return true;
     }
 
     /// <summary>
-    /// Get active blackout window (if any)
+    /// Get active blackout window (if any). Accepts any local DateTime — converts to ET internally.
     /// </summary>
     public BlackoutWindow? GetActiveBlackout(DateTime currentTime)
     {
-        var timeOfDay = currentTime.TimeOfDay;
+        var etTimeOfDay = ToEasternTimeOfDay(currentTime);
 
         foreach (var window in blackoutWindows)
         {
-            if (timeOfDay >= window.Start && timeOfDay < window.End)
-            {
+            if (etTimeOfDay >= window.Start && etTimeOfDay < window.End)
                 return window;
-            }
         }
 
         return null;

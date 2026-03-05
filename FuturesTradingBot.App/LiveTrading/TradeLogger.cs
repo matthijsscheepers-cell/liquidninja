@@ -12,6 +12,18 @@ public class TradeLogger : IDisposable
     private readonly string asset;
     private readonly StreamWriter writer;
     private readonly string logPath;
+    private readonly string historyPath;
+
+    // Static lock so MGC and MES bots don't interleave writes to the shared CSV
+    private static readonly object HistoryLock = new();
+
+    private static readonly string[] HistoryCsvHeader =
+        ["date", "time", "asset", "direction", "setup",
+         "entry_price", "exit_price", "exit_reason", "exit_quality", "pnl"];
+
+    // These exit reasons don't represent completed trades worth tracking
+    private static readonly HashSet<string> SkipReasons =
+        ["LIMIT_EXPIRED", "RECONCILE_NO_FILL", "BAR_EXPIRED", "RECONCILE_MISMATCH"];
 
     public string LogPath => logPath;
 
@@ -19,13 +31,39 @@ public class TradeLogger : IDisposable
     {
         this.asset = asset;
 
-        var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+        // Prefer a persistent logs folder next to the solution root, outside bin/Debug.
+        // Falls back to the old bin/Debug/logs location if the solution root can't be found.
+        var solutionRoot = FindSolutionRoot(AppDomain.CurrentDomain.BaseDirectory);
+        var logDir = solutionRoot != null
+            ? Path.Combine(solutionRoot, "logs")
+            : Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
         Directory.CreateDirectory(logDir);
 
-        logPath = Path.Combine(logDir, $"trades_{asset}_{DateTime.Now:yyyy-MM-dd}.jsonl");
+        logPath     = Path.Combine(logDir, $"trades_{asset}_{DateTime.Now:yyyy-MM-dd}.jsonl");
+        historyPath = Path.Combine(logDir, "trades_history.csv");
         writer = new StreamWriter(logPath, append: true) { AutoFlush = true };
 
+        // Write CSV header if the file doesn't exist yet
+        lock (HistoryLock)
+        {
+            if (!File.Exists(historyPath))
+                File.WriteAllText(historyPath, string.Join(",", HistoryCsvHeader) + "\n");
+        }
+
         LogStatus(DateTime.Now, $"Logger started for {asset}");
+    }
+
+    // Walk up from baseDir until we find the .slnx file — that's the solution root.
+    private static string? FindSolutionRoot(string baseDir)
+    {
+        var dir = new DirectoryInfo(baseDir);
+        while (dir != null)
+        {
+            if (dir.GetFiles("*.slnx").Length > 0 || dir.GetFiles("*.sln").Length > 0)
+                return dir.FullName;
+            dir = dir.Parent;
+        }
+        return null;
     }
 
     public void LogSignal(DateTime time, TradeSetup setup, bool taken, string reason)
@@ -53,7 +91,7 @@ public class TradeLogger : IDisposable
         };
 
         WriteAndPrint(entry, taken
-            ? $"SIGNAL {setup.Direction} {asset} @ ${setup.EntryPrice:F2} → TAKEN"
+            ? $"SIGNAL {setup.Direction} {asset} @ ${setup.EntryPrice:F2} → WATCH ARMED (waiting for EMA touch)"
             : $"SIGNAL {setup.Direction} {asset} @ ${setup.EntryPrice:F2} → SKIPPED: {reason}");
     }
 
@@ -91,6 +129,7 @@ public class TradeLogger : IDisposable
 
     public void LogExit(DateTime time, Position pos, decimal exitPrice, decimal pnl, string reason)
     {
+        var exitQuality = reason is "STOP" or "TARGET" ? "real" : "estimated";
         var entry = new
         {
             type = "EXIT",
@@ -102,11 +141,36 @@ public class TradeLogger : IDisposable
             contracts = pos.Contracts,
             pnl,
             reason,
+            exitQuality,
             strategy = pos.EntryStrategy
         };
 
         var icon = pnl >= 0 ? "+" : "";
         WriteAndPrint(entry, $"EXIT {pos.Direction} {asset}: {icon}${pnl:F2} ({reason})");
+
+        // Append to persistent history CSV (skips non-trade exits like LIMIT_EXPIRED)
+        if (!SkipReasons.Contains(reason))
+            AppendHistoryCsv(time, pos, exitPrice, pnl, reason);
+    }
+
+    private void AppendHistoryCsv(DateTime time, Position pos, decimal exitPrice, decimal pnl, string reason)
+    {
+        // STOP and TARGET are real fills; RECONCILE is a synthetic estimate
+        var quality = reason is "STOP" or "TARGET" ? "real" : "estimated";
+        var row = string.Join(",",
+            time.ToString("yyyy-MM-dd"),
+            time.ToString("HH:mm:ss"),
+            asset,
+            pos.Direction.ToString(),
+            pos.EntryStrategy ?? "",
+            pos.EntryPrice.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
+            exitPrice.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
+            reason,
+            quality,
+            pnl.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
+
+        lock (HistoryLock)
+            File.AppendAllText(historyPath, row + "\n");
     }
 
     public void LogStopUpdate(DateTime time, decimal oldStop, decimal newStop)

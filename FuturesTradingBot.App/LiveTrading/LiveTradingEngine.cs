@@ -42,6 +42,8 @@ public class LiveTradingEngine
     private DateTime _lastBarPoll = DateTime.MinValue;
     private int _consecutivePollFailures = 0;
     private DateTime _lastConnectedAt = DateTime.Now; // track last time socket was alive
+    private CancellationTokenSource? _reconcilePendingCts; // debounce: wait for execDetails before logging RECONCILE
+    private int? _ghostCloseOrderId; // tracks a market-close order placed for an unrecognised ghost position
 
     // Stats
     private int totalTrades;
@@ -99,13 +101,24 @@ public class LiveTradingEngine
         string exchange = asset == "MGC" ? "COMEX" : "CME";
         connector.WaitForHmds(timeoutSeconds: 15);
 
-        var resolved = connector.ResolveFrontMonthContract(asset, "FUT", exchange);
-        if (resolved == null)
+        // Retry loop — do NOT disconnect/throw on failure. During TWS daily reconnect the data
+        // farms take several minutes to come back. Staying connected and waiting avoids the
+        // crash-restart cycle (which causes Error 326 clientId conflicts and log spam).
+        Contract? resolved = null;
+        int contractAttempt = 0;
+        while (resolved == null)
         {
-            logger.LogError(DateTime.Now, $"Could not resolve front-month contract for {asset} — cannot trade safely. Exiting.");
-            connector.Disconnect();
-            await Task.Delay(5000); // let socket fully close before restart creates a new connection
-            throw new Exception($"Could not resolve front-month contract for {asset} — triggering restart");
+            resolved = connector.ResolveFrontMonthContract(asset, "FUT", exchange);
+            if (resolved == null)
+            {
+                contractAttempt++;
+                logger.LogStatus(DateTime.Now,
+                    $"Contract resolution attempt {contractAttempt} failed — IBKR data farms not ready. Waiting 90s...");
+                for (int i = 0; i < 90 && isRunning; i++)
+                    await Task.Delay(1000);
+                if (!isRunning) return;
+                connector.WaitForHmds(timeoutSeconds: 30);
+            }
         }
         contract = resolved;
         logger.LogStatus(DateTime.Now,
@@ -191,6 +204,9 @@ public class LiveTradingEngine
 
         // 8b. Cancel any orphan GTC orders for this asset left over from previous sessions.
         // Must run AFTER state restoration so we can exclude the current position's live orders.
+        // Also tracks which keepIds are actually confirmed live in IBKR (to detect if a previous
+        // failed restart already cancelled our stop/target — so we can re-place them).
+        var liveOrderIds = new HashSet<int>(); // keepIds that IBKR confirmed as active
         {
             var orphanIds = new List<int>();
             var tcsOrders = new TaskCompletionSource<bool>();
@@ -203,8 +219,13 @@ public class LiveTradingEngine
 
             connector.OnOpenOrder += (orderId, symbol) =>
             {
-                if (symbol.Equals(asset, StringComparison.OrdinalIgnoreCase) && !keepIds.Contains(orderId))
-                    orphanIds.Add(orderId);
+                if (symbol.Equals(asset, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!keepIds.Contains(orderId))
+                        orphanIds.Add(orderId);
+                    else
+                        liveOrderIds.Add(orderId); // one of our position's orders is still active
+                }
             };
             connector.OnOpenOrderEnd += () => tcsOrders.TrySetResult(true);
 
@@ -217,6 +238,34 @@ public class LiveTradingEngine
                 foreach (var id in orphanIds)
                     connector.CancelOrder(id);
                 await Task.Delay(500); // let cancellations process
+            }
+        }
+
+        // 8c. If we restored a confirmed open position whose stop/target orders were already
+        // cancelled by a previous failed restart, re-place them so the position is protected.
+        if (stateRestored && _entryConfirmed && openPosition != null)
+        {
+            bool stopMissing   = !stopOrderId.HasValue   || !liveOrderIds.Contains(stopOrderId.Value);
+            bool targetMissing = !targetOrderId.HasValue || !liveOrderIds.Contains(targetOrderId.Value);
+
+            if (stopMissing || targetMissing)
+            {
+                logger.LogStatus(DateTime.Now,
+                    $"Stop/target orders missing from IBKR (stop live={!stopMissing}, target live={!targetMissing}) " +
+                    $"— re-placing exit orders to protect restored {openPosition.Direction} position");
+
+                var (newStop, newTarget) = connector.PlaceExitOrders(
+                    contract, openPosition.Direction,
+                    openPosition.StopLoss, openPosition.Target);
+
+                if (newStop > 0)
+                {
+                    stopOrderId   = newStop;
+                    targetOrderId = newTarget;
+                    string exitAction = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
+                    logger.LogOrder(DateTime.Now, newStop,   exitAction, "STP", openPosition.StopLoss, 1);
+                    logger.LogOrder(DateTime.Now, newTarget, exitAction, "LMT", openPosition.Target,   1);
+                }
             }
         }
 
@@ -233,59 +282,19 @@ public class LiveTradingEngine
         connector.OnStreamingBarUpdate += (_, t, o, h, l, c, v) =>
         {
             aggregator.UpdateStreamingBar(t, o, h, l, c, v);
-
-            // Forming-bar EMA scan (runs every ~5 sec):
-            //   Step 1 — bar_low ≤ EMA + 0.5 ATR  (LONG)  or  bar_high ≥ EMA - 0.5 ATR (SHORT)
-            //            → EMA zone has been touched at some point during this bar
-            //   Step 2 — check current offer (≈ streaming close):
-            //            offer ≤ EMA + 0.1 ATR  → MARKET ORDER  (price is right at EMA now)
-            //            offer > EMA            → LIMIT ORDER at EMA  (price bounced, wait for return)
-            // This matches the reference bot behaviour and the backtest fill assumption.
-            if (_intrabarWatch != null && openPosition == null && entryOrderId == null && !_eodFlattenDone)
-            {
-                decimal formingHigh  = (decimal)h;
-                decimal formingLow   = (decimal)l;
-                decimal currentOffer = (decimal)c;   // last traded price ≈ offer in futures
-                decimal ema          = _intrabarWatch.EntryPrice;
-                decimal atr          = _intrabarWatchAtr;
-
-                // Step 1: has the forming bar's low/high entered the EMA zone?
-                bool emaTouched = _intrabarWatch.Direction == SignalDirection.LONG
-                    ? formingLow  <= ema + 0.5m * atr
-                    : formingHigh >= ema - 0.5m * atr;
-
-                if (emaTouched)
-                {
-                    var watch         = _intrabarWatch;
-                    var watchContracts = _intrabarWatchContracts;
-                    _intrabarWatch    = null;   // clear before placing to prevent re-entry
-                    var triggerTime   = DateTime.Now;
-
-                    // Step 2: market if price is right at EMA, limit if it bounced above
-                    bool priceAtEma = watch.Direction == SignalDirection.LONG
-                        ? currentOffer <= ema + 0.1m * atr
-                        : currentOffer >= ema - 0.1m * atr;
-
-                    if (priceAtEma)
-                    {
-                        logger.LogStatus(triggerTime,
-                            $"INTRABAR_MARKET: {watch.Direction} offer {currentOffer:F2} at EMA {ema:F2} (±0.1 ATR) — market order");
-                        PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: true);
-                    }
-                    else
-                    {
-                        logger.LogStatus(triggerTime,
-                            $"INTRABAR_LIMIT: {watch.Direction} bar touched EMA zone (low {formingLow:F2} / high {formingHigh:F2}) " +
-                            $"but offer {currentOffer:F2} above EMA {ema:F2} — limit order");
-                        PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: false);
-                    }
-                }
-            }
+            CheckIntrabarTrigger((decimal)h, (decimal)l, (decimal)c);
         };
+
+        // 5-sec real-time bars: much more reliable than keepUpToDate 15-min updates.
+        // Used exclusively for the intrabar EMA scan — gives a new tick every 5 seconds.
+        connector.OnRealtimeBar += (_, t, o, h, l, c, v) =>
+            CheckIntrabarTrigger((decimal)h, (decimal)l, (decimal)c);
 
         // Subscribe to streaming bars (keepUpToDate=true) — delivers updates within seconds
         connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
-        logger.LogStatus(DateTime.Now, "Streaming bars subscribed (keepUpToDate=true)...");
+        // Subscribe to 5-sec real-time bars for the intrabar scan (uses specific front-month contract)
+        connector.SubscribeRealtimeBars(asset, contract);
+        logger.LogStatus(DateTime.Now, "Streaming bars subscribed (keepUpToDate=true + 5-sec realtime)...");
 
         // 9. Handle reconnects — re-subscribe to streaming and immediately re-check positions
         // so any fills that arrived during the outage are confirmed before LIMIT_EXPIRED fires.
@@ -293,6 +302,7 @@ public class LiveTradingEngine
         {
             logger.LogStatus(DateTime.Now, "IBKR reconnected - re-subscribing to streaming bars...");
             connector.SubscribeStreamingBars(asset, streamingContract, "15 mins");
+            connector.SubscribeRealtimeBars(asset, contract);
             _positionSeenInReconcile = false;
             connector.RequestPositions();
         };
@@ -674,6 +684,60 @@ public class LiveTradingEngine
         }
     }
 
+    /// <summary>
+    /// Check whether the forming bar has touched the EMA zone and place an entry order if so.
+    /// Called from both OnStreamingBarUpdate (15-min keepUpToDate) and OnRealtimeBar (5-sec).
+    /// h/l/c are the bar's high, low, and last price for this update tick.
+    /// </summary>
+    private void CheckIntrabarTrigger(decimal h, decimal l, decimal c)
+    {
+        // Forming-bar EMA scan:
+        //   Step 1a — bar_low ≤ EMA + 0.5 ATR  (LONG)  or  bar_high ≥ EMA - 0.5 ATR (SHORT)
+        //             → EMA zone has been touched at some point during this bar
+        //   Step 1b — bar_low ≥ EMA - 0.5 ATR  (LONG)  or  bar_high ≤ EMA + 0.5 ATR (SHORT)
+        //             → price didn't crash THROUGH the EMA zone (too-deep pullback = bad quality)
+        //   Step 2  — check current offer (≈ last traded price ≈ close of this tick):
+        //             offer ≤ EMA + 0.1 ATR  → MARKET ORDER  (price is right at EMA now)
+        //             offer > EMA            → LIMIT ORDER at EMA  (price bounced, wait for return)
+        if (_intrabarWatch == null || openPosition != null || entryOrderId != null || _eodFlattenDone)
+            return;
+
+        decimal formingHigh  = h;
+        decimal formingLow   = l;
+        decimal currentOffer = c;
+        decimal ema          = _intrabarWatch.EntryPrice;
+        decimal atr          = _intrabarWatchAtr;
+
+        bool emaTouched = _intrabarWatch.Direction == SignalDirection.LONG
+            ? formingLow  <= ema + 0.5m * atr && formingLow  >= ema - 0.5m * atr
+            : formingHigh >= ema - 0.5m * atr && formingHigh <= ema + 0.5m * atr;
+
+        if (!emaTouched) return;
+
+        var watch          = _intrabarWatch;
+        var watchContracts = _intrabarWatchContracts;
+        _intrabarWatch     = null;   // clear before placing to prevent re-entry
+        var triggerTime    = DateTime.Now;
+
+        bool priceAtEma = watch.Direction == SignalDirection.LONG
+            ? currentOffer <= ema + 0.1m * atr
+            : currentOffer >= ema - 0.1m * atr;
+
+        if (priceAtEma)
+        {
+            logger.LogStatus(triggerTime,
+                $"INTRABAR_MARKET: {watch.Direction} offer {currentOffer:F2} at EMA {ema:F2} (±0.1 ATR) — market order");
+            PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: true);
+        }
+        else
+        {
+            logger.LogStatus(triggerTime,
+                $"INTRABAR_LIMIT: {watch.Direction} bar touched EMA zone (low {formingLow:F2} / high {formingHigh:F2}) " +
+                $"but offer {currentOffer:F2} above EMA {ema:F2} — limit order");
+            PlaceEntryOrder(watch, watchContracts, triggerTime, isMarket: false);
+        }
+    }
+
     private void PlaceEntryOrder(TradeSetup setup, int contracts, DateTime barTime, bool isMarket = false)
     {
         decimal roundedEntry  = RoundToTick(setup.EntryPrice);
@@ -735,6 +799,10 @@ public class LiveTradingEngine
         // Stop or target fill
         if ((orderId == stopOrderId || orderId == targetOrderId) && qty > 0 && openPosition != null)
         {
+            // Cancel any pending RECONCILE debounce — real fill is being handled now
+            _reconcilePendingCts?.Cancel();
+            _reconcilePendingCts = null;
+
             var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
             decimal priceMove = openPosition.Direction == SignalDirection.LONG
                 ? fillPrice - openPosition.EntryPrice
@@ -764,6 +832,40 @@ public class LiveTradingEngine
         }
     }
 
+    // Called by the RECONCILE debounce (5s after flat detected) if no real fill arrived in time.
+    private void ProcessReconcileExit(Position pos, int? snapStop, int? snapTarget, DateTime now)
+    {
+        var lastClose = aggregator.Bars15Min.LastOrDefault()?.Close ?? pos.EntryPrice;
+        var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
+        decimal priceMove = pos.Direction == SignalDirection.LONG
+            ? lastClose - pos.EntryPrice
+            : pos.EntryPrice - lastClose;
+        decimal pnl = priceMove * multiplier * pos.Contracts;
+
+        logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {pos.Direction} open @ ${pos.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
+        logger.LogExit(now, pos, lastClose, pnl, "RECONCILE");
+
+        if (snapStop.HasValue)   connector.CancelOrder(snapStop.Value);
+        if (snapTarget.HasValue) connector.CancelOrder(snapTarget.Value);
+
+        totalTrades++;
+        totalPnL += pnl;
+        currentBalance += pnl;
+        if (pnl > 0) wins++;
+        else if (pnl < 0) losses++;
+
+        riskManager.RecordTradeResult(pnl, pnl > 0, now);
+
+        if (strategy is TTMSqueezePullbackStrategy ttm)
+            ttm.SetLastExitBar(barIndex);
+
+        openPosition = null;
+        entryOrderId = null;
+        stopOrderId = null;
+        targetOrderId = null;
+        _entryConfirmed = false;
+    }
+
     private void HandlePositionUpdate(string symbol, int ibkrQty)
     {
         // Only handle our asset (IBKR reports the underlying symbol, e.g. "MGC" or "MES")
@@ -778,35 +880,29 @@ public class LiveTradingEngine
         {
             if (_entryConfirmed)
             {
-                // Entry was confirmed filled → position was closed while we were offline
-                // (stop or target hit, or IBKR Mobile disconnected Gateway session)
-                var lastClose = aggregator.Bars15Min.LastOrDefault()?.Close ?? openPosition.EntryPrice;
+                // IBKR's position callback can arrive before execDetails for the fill that caused it.
+                // Debounce: give execDetails 5 seconds to arrive and handle the exit properly.
+                // If the real fill arrives in time, it cancels this timer and logs STOP/TARGET.
+                // Otherwise, fall back to a synthetic RECONCILE exit using the last bar close.
+                if (_reconcilePendingCts != null) return; // already waiting — do nothing
 
-                var multiplier = Multipliers.GetValueOrDefault(asset, 10m);
-                decimal priceMove = openPosition.Direction == SignalDirection.LONG
-                    ? lastClose - openPosition.EntryPrice
-                    : openPosition.EntryPrice - lastClose;
+                var cts = new CancellationTokenSource();
+                _reconcilePendingCts = cts;
 
-                decimal pnl = priceMove * multiplier * openPosition.Contracts;
+                // Snapshot current state — the delayed task captures it even if fields change
+                var snapPos    = openPosition;
+                var snapStop   = stopOrderId;
+                var snapTarget = targetOrderId;
 
-                logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {openPosition.Direction} open @ ${openPosition.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
-                logger.LogExit(now, openPosition, lastClose, pnl, "RECONCILE");
+                Task.Delay(5000, cts.Token).ContinueWith(t =>
+                {
+                    if (t.IsCanceled) return; // real fill arrived and handled it
+                    _reconcilePendingCts = null;
+                    if (openPosition == null) return; // real fill already cleared it
+                    ProcessReconcileExit(snapPos!, snapStop, snapTarget, DateTime.Now);
+                }, TaskScheduler.Default);
 
-                // Cancel any orphan GTC stop/target orders still sitting in TWS
-                if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
-                if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
-
-                // Update stats
-                totalTrades++;
-                totalPnL += pnl;
-                currentBalance += pnl;
-                if (pnl > 0) wins++;
-                else if (pnl < 0) losses++;
-
-                riskManager.RecordTradeResult(pnl, pnl > 0, now);
-
-                if (strategy is TTMSqueezePullbackStrategy ttm)
-                    ttm.SetLastExitBar(barIndex);
+                return; // don't clear state yet — let the debounce decide
             }
             else
             {
@@ -846,12 +942,29 @@ public class LiveTradingEngine
             return;
         }
 
-        // Case B: IBKR has a position but bot has none — unexpected (ghost position)
+        // Case B: IBKR has a position but bot has none — ghost position, auto-close it
         if (ibkrQty != 0 && openPosition == null)
         {
-            logger.LogStatus(now, $"RECONCILE WARNING: IBKR shows {asset} qty={ibkrQty} but bot has no open position — possible ghost position, check TWS manually");
+            // If we already placed a close order, wait for it to fill before placing another
+            if (_ghostCloseOrderId.HasValue)
+            {
+                logger.LogStatus(now, $"RECONCILE: ghost close order #{_ghostCloseOrderId} pending — waiting for fill");
+                return;
+            }
+
+            string closeAction = ibkrQty > 0 ? "SELL" : "BUY";
+            int absQty = Math.Abs(ibkrQty);
+            logger.LogStatus(now,
+                $"RECONCILE: ghost position detected ({asset} qty={ibkrQty}) — placing market {closeAction} {absQty}x to flatten");
+            int closeId = connector.PlaceMarketOrder(contract, closeAction, absQty);
+            if (closeId > 0)
+                _ghostCloseOrderId = closeId;
             return;
         }
+
+        // Clear ghost-close tracker once IBKR confirms flat
+        if (ibkrQty == 0 && _ghostCloseOrderId.HasValue)
+            _ghostCloseOrderId = null;
 
         // Case C: Both IBKR and bot have a position — check sign matches
         if (ibkrQty != 0 && openPosition != null)
@@ -908,8 +1021,9 @@ public class LiveTradingEngine
     /// </summary>
     private bool RestoreStateFromLog()
     {
-        var logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
-        var logPath = Path.Combine(logDir, $"trades_{asset}_{DateTime.Now:yyyy-MM-dd}.jsonl");
+        // Use the same path the logger is writing to — avoids mismatch between
+        // bin/Debug/logs (old path) and solution-root/logs (current path).
+        var logPath = logger.LogPath;
 
         if (!File.Exists(logPath)) return false;
 
@@ -958,15 +1072,31 @@ public class LiveTradingEngine
                         var oType = doc.GetStringOrEmpty("orderType");
                         var oId = doc.TryGetProperty("orderId", out var oid) ? oid.GetInt32() : 0;
                         var oAction = doc.GetStringOrEmpty("action");
+                        var oPrice = doc.GetDecimalOrZero("price"); // already tick-rounded
 
                         if (oType == "STP")
+                        {
                             logStopId = oId;
+                            if (oPrice > 0) posStop = oPrice; // prefer rounded ORDER price over raw SIGNAL price
+                        }
+                        else if (oType == "MKT")
+                        {
+                            // Market bracket entry — always the entry order
+                            bool isEntryDir = (posDir == "LONG" && oAction == "BUY") ||
+                                             (posDir == "SHORT" && oAction == "SELL");
+                            if (isEntryDir) logEntryId = oId;
+                        }
                         else if (oType == "LMT")
                         {
                             bool isEntryDir = (posDir == "LONG" && oAction == "BUY") ||
                                              (posDir == "SHORT" && oAction == "SELL");
-                            if (isEntryDir) logEntryId = oId;
-                            else            logTargetId = oId;
+                            if (isEntryDir)
+                                logEntryId = oId;
+                            else
+                            {
+                                logTargetId = oId;
+                                if (oPrice > 0) posTarget = oPrice; // prefer rounded ORDER price
+                            }
                         }
                     }
                     break;
@@ -1012,6 +1142,35 @@ public class LiveTradingEngine
             currentBalance = startingBalance + recoveredPnL;
             logger.LogStatus(DateTime.Now,
                 $"Restored today's stats: {recoveredTrades} trades ({recoveredWins}W/{recoveredLosses}L), P&L=${recoveredPnL:F2}");
+        }
+
+        // Restore intrabar watch if the last signal was taken but no order was placed yet.
+        // This means the watch was armed at bar-close but the bot restarted before the
+        // EMA zone was touched. The watch is valid until the NEXT bar closes:
+        //   posTime (bar open) + 15 min (bar close) + 15 min (next bar) = posTime + 30 min.
+        if (posDir != null && logEntryId == 0 && openPosition == null)
+        {
+            var watchExpiry = posTime.AddMinutes(30);
+            if (DateTime.Now < watchExpiry)
+            {
+                var watchDir = posDir == "LONG" ? SignalDirection.LONG : SignalDirection.SHORT;
+                _intrabarWatch = new TradeSetup
+                {
+                    Direction    = watchDir,
+                    EntryPrice   = posEntry,
+                    StopLoss     = posStop,
+                    Target       = posTarget,
+                    RiskPerShare = posRisk,
+                    SetupType    = posSetup,
+                    Asset        = asset
+                };
+                _intrabarWatchAtr       = posRisk;      // riskPerShare ≈ stop distance ≈ ATR
+                _intrabarWatchContracts = posContracts; // 1 contract (default)
+                logger.LogStatus(DateTime.Now,
+                    $"Restored intrabar watch: {posDir} EMA {posEntry:F2} ATR {posRisk:F2} " +
+                    $"(valid until {watchExpiry:HH:mm})");
+            }
+            return false; // no open position to restore
         }
 
         // Restore open position if one was in flight
@@ -1073,6 +1232,43 @@ public class LiveTradingEngine
             {
                 foreach (var hb in rawBars)
                     aggregator.UpdateStreamingBar(hb.Time, hb.Open, hb.High, hb.Low, hb.Close, hb.Volume);
+
+                // Intrabar scan on the forming bar's running OHLC.
+                // The last bar returned by IBKR is the current in-progress bar; its running
+                // low/high captures every price touch since the bar opened — so even a brief
+                // EMA dip that lasted only seconds will show up here on the next poll.
+                var forming = rawBars.Last();
+                CheckIntrabarTrigger(forming.High, forming.Low, forming.Close);
+
+                // EMA drift: if watch is still armed (no order placed), recompute the EMA
+                // from the last closed bar's EMA + one incremental step using the forming bar's
+                // current close. In a trending market the EMA drifts 0.05–0.15 ATR per bar;
+                // keeping the watch EMA current prevents misses where price touches the
+                // *visible* EMA but doesn't reach our stale (lower) limit price.
+                if (_intrabarWatch != null && entryOrderId == null)
+                {
+                    var completedBars = aggregator.Bars15Min;
+                    if (completedBars.Count > 0)
+                    {
+                        var lastClosed = completedBars[^1];
+                        if (lastClosed.Metadata != null &&
+                            lastClosed.Metadata.TryGetValue("ema_21", out var emaObj) && emaObj is decimal lastEma)
+                        {
+                            const decimal alpha = 2m / 22m; // EMA(21) smoothing factor
+                            decimal liveEma = lastEma + alpha * (forming.Close - lastEma);
+                            decimal drift   = liveEma - _intrabarWatch.EntryPrice;
+
+                            if (Math.Abs(drift) > 0.05m * _intrabarWatchAtr)
+                            {
+                                _intrabarWatch.EntryPrice += drift;
+                                _intrabarWatch.StopLoss   += drift;
+                                _intrabarWatch.Target     += drift;
+                                logger.LogStatus(DateTime.Now,
+                                    $"WATCH_DRIFT: EMA moved {drift:+0.00;-0.00} → watch updated to {_intrabarWatch.EntryPrice:F2}");
+                            }
+                        }
+                    }
+                }
             }
         }
         else // null = timeout — connection may be dead

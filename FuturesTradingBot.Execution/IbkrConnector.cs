@@ -162,6 +162,12 @@ public partial class IbkrConnector : EWrapper
                 errorMsg.Contains("HDMS", StringComparison.OrdinalIgnoreCase))
                 IsHmdsConnected = false;
         }
+        else if (errorCode == 354 || errorCode == 420)
+        {
+            // No real-time market data subscription — reqRealTimeBars not available.
+            // Fall back gracefully; intrabar scan will use keepUpToDate + poll data instead.
+            Console.WriteLine($"Info: No real-time bar data — using polling fallback for intrabar scan");
+        }
         else if (errorCode == 1100)
         {
             // Connection lost
@@ -253,34 +259,50 @@ public partial class IbkrConnector : EWrapper
     /// </summary>
     public Contract? ResolveFrontMonthContract(string symbol, string secType, string exchange)
     {
-        int reqId = Interlocked.Increment(ref _histReqIdCounter);
-        var results = new List<ContractDetails>();
-        var done = new ManualResetEventSlim(false);
-
-        lock (_contractDetailsResults)
+        // Retry up to 3 times — reqContractDetails can time out if IBKR is slow after connect
+        for (int attempt = 1; attempt <= 3; attempt++)
         {
-            _contractDetailsResults[reqId] = results;
-            _contractDetailsEvents[reqId] = done;
+            int reqId = Interlocked.Increment(ref _histReqIdCounter);
+            var results = new List<ContractDetails>();
+            var done = new ManualResetEventSlim(false);
+
+            lock (_contractDetailsResults)
+            {
+                _contractDetailsResults[reqId] = results;
+                _contractDetailsEvents[reqId] = done;
+            }
+
+            var template = new Contract
+            {
+                Symbol = symbol,
+                SecType = secType,
+                Currency = "USD",
+                Exchange = exchange
+            };
+
+            clientSocket.reqContractDetails(reqId, template);
+
+            done.Wait(TimeSpan.FromSeconds(15));
+
+            lock (_contractDetailsResults)
+            {
+                _contractDetailsResults.Remove(reqId);
+                _contractDetailsEvents.Remove(reqId);
+            }
+
+            if (results.Count > 0)
+                return SelectFrontMonthFromResults(results);
+
+            Console.WriteLine($"[ResolveFrontMonth] Attempt {attempt}/3 returned 0 results for {symbol} — retrying in 8s...");
+            if (attempt < 3)
+                Thread.Sleep(8000);
         }
 
-        var template = new Contract
-        {
-            Symbol = symbol,
-            SecType = secType,
-            Currency = "USD",
-            Exchange = exchange
-        };
+        return null;
+    }
 
-        clientSocket.reqContractDetails(reqId, template);
-
-        done.Wait(TimeSpan.FromSeconds(10));
-
-        lock (_contractDetailsResults)
-        {
-            _contractDetailsResults.Remove(reqId);
-            _contractDetailsEvents.Remove(reqId);
-        }
-
+    private static Contract? SelectFrontMonthFromResults(List<ContractDetails> results)
+    {
         if (results.Count == 0) return null;
 
         // Skip contracts expiring within 5 days (physical delivery window) and pick the nearest valid one
@@ -492,6 +514,68 @@ public partial class IbkrConnector : EWrapper
         clientSocket.placeOrder(targetId, contract, targetOrder);
 
         return parentId;
+    }
+
+    /// <summary>
+    /// Place standalone exit orders (STP stop + LMT target) for an already-filled position.
+    /// Used when restoring state after a restart that cancelled the original bracket children.
+    /// Both orders are OCA-linked so one cancel triggers the other.
+    /// Returns (stopId, targetId).
+    /// </summary>
+    public (int stopId, int targetId) PlaceExitOrders(
+        Contract contract,
+        SignalDirection direction,
+        decimal stopPrice,
+        decimal targetPrice,
+        int quantity = 1)
+    {
+        if (!clientSocket.IsConnected())
+        {
+            Console.WriteLine("Not connected - cannot place exit orders!");
+            return (-1, -1);
+        }
+
+        string exitAction = direction == SignalDirection.LONG ? "SELL" : "BUY";
+        string ocaGroup   = $"LIQUIDNINJA_EXIT_{nextOrderId}";
+
+        int stopId   = nextOrderId++;
+        int targetId = nextOrderId++;
+
+        var stopOrder = new Order
+        {
+            OrderId       = stopId,
+            Action        = exitAction,
+            OrderType     = "STP",
+            TotalQuantity = quantity,
+            AuxPrice      = (double)stopPrice,
+            OcaGroup      = ocaGroup,
+            OcaType       = 1,
+            Transmit      = false,
+            Tif           = "GTC"
+        };
+
+        var targetOrder = new Order
+        {
+            OrderId       = targetId,
+            Action        = exitAction,
+            OrderType     = "LMT",
+            TotalQuantity = quantity,
+            LmtPrice      = (double)targetPrice,
+            OcaGroup      = ocaGroup,
+            OcaType       = 1,
+            Transmit      = true,
+            Tif           = "GTC"
+        };
+
+        orderTracking[stopId]   = new OrderInfo { OrderId = stopId,   Type = "STOP",   Status = "PendingSubmit" };
+        orderTracking[targetId] = new OrderInfo { OrderId = targetId, Type = "TARGET", Status = "PendingSubmit" };
+
+        Console.WriteLine($"📤 Re-placing exit orders: {exitAction} STP ${stopPrice:F2} (#{stopId}) | LMT ${targetPrice:F2} (#{targetId})");
+
+        clientSocket.placeOrder(stopId,   contract, stopOrder);
+        clientSocket.placeOrder(targetId, contract, targetOrder);
+
+        return (stopId, targetId);
     }
 
     /// <summary>
