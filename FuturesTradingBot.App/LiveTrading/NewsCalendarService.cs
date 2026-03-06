@@ -24,10 +24,6 @@ public class NewsCalendarService
         "https://nfs.faireconomy.media/ff_calendar_nextweek.xml",
     ];
 
-    // ForexFactory event times are published in Eastern Time (ET / America/New_York).
-    private static readonly TimeZoneInfo EasternTz = TimeZoneInfo.FindSystemTimeZoneById(
-        OperatingSystem.IsWindows() ? "Eastern Standard Time" : "America/New_York");
-
     // ── State ────────────────────────────────────────────────────────────────
     private readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(15) };
     private readonly TradeLogger _logger;
@@ -128,9 +124,9 @@ public class NewsCalendarService
 
             string title   = (el.Element("title")?.Value   ?? "").Trim();
             string dateStr = (el.Element("date")?.Value    ?? "").Trim();  // MM-DD-YYYY
-            string timeStr = (el.Element("time")?.Value    ?? "").Trim();  // e.g. "8:30am"
+            string timeStr = (el.Element("time")?.Value    ?? "").Trim();  // e.g. "1:30pm" (UTC)
 
-            if (!TryParseEasternDateTime(dateStr, timeStr, out DateTime utcTime)) continue;
+            if (!TryParseUtcDateTime(dateStr, timeStr, out DateTime utcTime)) continue;
 
             events.Add(new NewsEvent(title, utcTime));
         }
@@ -138,7 +134,7 @@ public class NewsCalendarService
         return events;
     }
 
-    private static bool TryParseEasternDateTime(string dateStr, string timeStr, out DateTime utcTime)
+    private static bool TryParseUtcDateTime(string dateStr, string timeStr, out DateTime utcTime)
     {
         utcTime = default;
 
@@ -147,14 +143,14 @@ public class NewsCalendarService
                 CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
             return false;
 
-        // Parse time: "8:30am", "2:00pm", "12:00am", etc.
+        // Parse time: "1:30pm", "2:00pm", "12:00am", etc.
+        // The faireconomy.media feed publishes times in UTC.
         // Normalise to uppercase so C# format "h:mmtt" matches.
         if (!TryParseTime(timeStr.ToUpperInvariant(), out var time))
             return false;
 
-        // Combine date + time as Eastern local, then convert to UTC (handles DST).
-        var easternLocal = DateTime.SpecifyKind(date + time, DateTimeKind.Unspecified);
-        utcTime = TimeZoneInfo.ConvertTimeToUtc(easternLocal, EasternTz);
+        // Combine date + time directly as UTC — no timezone conversion needed.
+        utcTime = DateTime.SpecifyKind(date + time, DateTimeKind.Utc);
         return true;
     }
 
