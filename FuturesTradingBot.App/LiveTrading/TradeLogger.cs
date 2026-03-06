@@ -1,11 +1,13 @@
 namespace FuturesTradingBot.App.LiveTrading;
 
+using System.Globalization;
 using System.Text.Json;
 using FuturesTradingBot.Core.Models;
 
 /// <summary>
-/// Append-only JSONL trade logger for live trading
-/// Logs signals, orders, fills, exits, and status messages
+/// Append-only JSONL trade logger for live trading.
+/// Logs signals, orders, fills, exits, and status messages to a daily .jsonl file.
+/// Also maintains trades_history.csv — one enriched row per completed trade.
 /// </summary>
 public class TradeLogger : IDisposable
 {
@@ -18,12 +20,15 @@ public class TradeLogger : IDisposable
     private static readonly object HistoryLock = new();
 
     private static readonly string[] HistoryCsvHeader =
-        ["date", "time", "asset", "direction", "setup",
-         "entry_price", "exit_price", "exit_reason", "exit_quality", "pnl"];
-
-    // These exit reasons don't represent completed trades worth tracking
-    private static readonly HashSet<string> SkipReasons =
-        ["LIMIT_EXPIRED", "RECONCILE_NO_FILL", "BAR_EXPIRED", "RECONCILE_MISMATCH"];
+    [
+        "date", "asset", "direction", "setup",
+        "order_type", "signal_time", "entry_time", "fill_price", "intended_ema", "offset_pct",
+        "atr_15m", "ema_1h", "hist_color", "dist_ema_atr",
+        "contracts", "stop_price", "target_price", "rrr",
+        "session", "day_of_week", "utc_hour",
+        "exit_type", "exit_price", "exit_quality", "pnl",
+        "r_multiple", "duration_mins", "consecutive_stops"
+    ];
 
     public string LogPath => logPath;
 
@@ -43,9 +48,23 @@ public class TradeLogger : IDisposable
         historyPath = Path.Combine(logDir, "trades_history.csv");
         writer = new StreamWriter(logPath, append: true) { AutoFlush = true };
 
-        // Write CSV header if the file doesn't exist yet
+        // Migrate old-format history CSV (old format started with "date,time,asset,...")
         lock (HistoryLock)
         {
+            if (File.Exists(historyPath))
+            {
+                var firstLine = File.ReadLines(historyPath).FirstOrDefault() ?? "";
+                bool isOldFormat = !firstLine.Contains("order_type");
+                if (isOldFormat)
+                {
+                    var backup = historyPath.Replace(".csv", "_v1_backup.csv");
+                    if (!File.Exists(backup))
+                        File.Move(historyPath, backup);
+                    else
+                        File.Delete(historyPath);
+                }
+            }
+
             if (!File.Exists(historyPath))
                 File.WriteAllText(historyPath, string.Join(",", HistoryCsvHeader) + "\n");
         }
@@ -147,27 +166,54 @@ public class TradeLogger : IDisposable
 
         var icon = pnl >= 0 ? "+" : "";
         WriteAndPrint(entry, $"EXIT {pos.Direction} {asset}: {icon}${pnl:F2} ({reason})");
-
-        // Append to persistent history CSV (skips non-trade exits like LIMIT_EXPIRED)
-        if (!SkipReasons.Contains(reason))
-            AppendHistoryCsv(time, pos, exitPrice, pnl, reason);
+        // CSV row is written separately via LogTradeRecord (richer data from LiveTradingEngine)
     }
 
-    private void AppendHistoryCsv(DateTime time, Position pos, decimal exitPrice, decimal pnl, string reason)
+    /// <summary>
+    /// Write one enriched row to trades_history.csv for a completed trade.
+    /// Only writes if record.IsComplete (entry fill + exit price both set).
+    /// </summary>
+    public void LogTradeRecord(TradeRecord record)
     {
-        // STOP and TARGET are real fills; RECONCILE is a synthetic estimate
-        var quality = reason is "STOP" or "TARGET" ? "real" : "estimated";
+        if (!record.IsComplete) return;
+
+        // Reward-to-risk ratio at signal time (using intended prices, not actual fill)
+        decimal denominator = Math.Abs(record.IntendedEma - record.StopPrice);
+        decimal rrr = denominator > 0
+            ? Math.Round(Math.Abs(record.TargetPrice - record.IntendedEma) / denominator, 2)
+            : 0m;
+
+        var ic = CultureInfo.InvariantCulture;
         var row = string.Join(",",
-            time.ToString("yyyy-MM-dd"),
-            time.ToString("HH:mm:ss"),
-            asset,
-            pos.Direction.ToString(),
-            pos.EntryStrategy ?? "",
-            pos.EntryPrice.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
-            exitPrice.ToString("F2", System.Globalization.CultureInfo.InvariantCulture),
-            reason,
-            quality,
-            pnl.ToString("F2", System.Globalization.CultureInfo.InvariantCulture));
+            record.SignalTime.ToString("yyyy-MM-dd", ic),
+            record.Asset,
+            record.Direction.ToString(),
+            record.SetupType,
+            record.OrderType,
+            record.SignalTime.ToString("HH:mm:ss", ic),
+            record.EntryTime?.ToString("HH:mm:ss", ic) ?? "",
+            record.FillPrice?.ToString("F2", ic) ?? "",
+            record.IntendedEma.ToString("F2", ic),
+            record.OffsetPct?.ToString("F4", ic) ?? "",
+            record.Atr15m.ToString("F2", ic),
+            record.Ema1h?.ToString("F2", ic) ?? "",
+            record.HistColor,
+            record.DistEmaAtr?.ToString("F3", ic) ?? "",
+            record.Contracts.ToString(),
+            record.StopPrice.ToString("F2", ic),
+            record.TargetPrice.ToString("F2", ic),
+            rrr.ToString("F2", ic),
+            record.Session,
+            record.DayOfWeek,
+            record.UtcHour.ToString(),
+            record.ExitType ?? "",
+            record.ExitPrice?.ToString("F2", ic) ?? "",
+            record.ExitQuality ?? "",
+            record.Pnl?.ToString("F2", ic) ?? "",
+            record.RMultiple?.ToString("F3", ic) ?? "",
+            record.DurationMins?.ToString() ?? "",
+            record.ConsecutiveStopsAtEntry.ToString()
+        );
 
         lock (HistoryLock)
             File.AppendAllText(historyPath, row + "\n");

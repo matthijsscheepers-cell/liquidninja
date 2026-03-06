@@ -31,6 +31,8 @@ public class LiveTradingEngine
     private int? targetOrderId;
     private bool _entryConfirmed;     // true once IBKR confirms the entry LMT was filled
     private bool _eodFlattenDone;     // true after EOD flatten fired today — blocks new entries
+    private bool _newsBlackoutActive; // true during high-impact economic event window (NFP/FOMC/CPI)
+    private NewsCalendarService _newsCalendar = null!;
     private bool _positionSeenInReconcile; // true if IBKR reported our asset in this reconcile cycle
     private DateTime _entryOrderPlacedAt; // when the current bracket was submitted (for grace-period protection)
     private TradeSetup? _intrabarWatch;   // pending signal: place order when forming bar touches EMA zone
@@ -40,10 +42,13 @@ public class LiveTradingEngine
     private bool isRunning;
     private int barIndex;
     private DateTime _lastBarPoll = DateTime.MinValue;
+    private DateTime _lastOrderVerify = DateTime.MinValue; // periodic stop/target liveness check
     private int _consecutivePollFailures = 0;
     private DateTime _lastConnectedAt = DateTime.Now; // track last time socket was alive
     private CancellationTokenSource? _reconcilePendingCts; // debounce: wait for execDetails before logging RECONCILE
     private int? _ghostCloseOrderId; // tracks a market-close order placed for an unrecognised ghost position
+    private TradeRecord? _tradeRecord;   // accumulates context for the current trade (signal → fill → exit)
+    private int _consecutiveStops;       // number of consecutive STOP_OUT exits (reset on TARGET/RECONCILE/EOD)
 
     // Stats
     private int totalTrades;
@@ -80,6 +85,7 @@ public class LiveTradingEngine
     public async Task Start()
     {
         logger = new TradeLogger(asset);
+        _newsCalendar = new NewsCalendarService(logger);
 
         logger.LogStatus(DateTime.Now, $"Starting live engine for {asset}");
         logger.LogStatus(DateTime.Now, $"Balance: ${startingBalance:F2}, Max daily loss: ${maxDailyLoss:F2}");
@@ -265,7 +271,17 @@ public class LiveTradingEngine
                     string exitAction = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
                     logger.LogOrder(DateTime.Now, newStop,   exitAction, "STP", openPosition.StopLoss, 1);
                     logger.LogOrder(DateTime.Now, newTarget, exitAction, "LMT", openPosition.Target,   1);
+                    logger.LogStatus(DateTime.Now,
+                        $"STARTUP: exit orders re-placed — new stop=#{newStop} target=#{newTarget}");
                 }
+                else
+                {
+                    logger.LogError(DateTime.Now,
+                        "STARTUP: PlaceExitOrders failed (not connected?) — position is unprotected! Periodic verify will retry.");
+                }
+
+                // Mark verify timer so the periodic check fires 5 min after startup
+                _lastOrderVerify = DateTime.Now;
             }
         }
 
@@ -309,7 +325,10 @@ public class LiveTradingEngine
 
         logger.LogStatus(DateTime.Now, "Live trading started (streaming mode)...");
 
-        // 10. Main loop — bar processing driven by streaming events
+        // 10. Fetch news calendar (non-blocking — bot starts even if feed is unavailable)
+        await _newsCalendar.RefreshAsync();
+
+        // 11. Main loop — bar processing driven by streaming events
         isRunning = true;
         var lastReconcile = DateTime.Now;
         // EOD flatten: prop firm rules — no overnight/weekend positions.
@@ -374,10 +393,26 @@ public class LiveTradingEngine
 
                     if (openPosition != null && _entryConfirmed)
                     {
+                        // Estimate EOD exit at last bar close (market order, real fill arrives async)
+                        var eodEstPrice = aggregator.Bars15Min.LastOrDefault()?.Close ?? openPosition.EntryPrice;
+                        var eodMulti    = Multipliers.GetValueOrDefault(asset, 10m);
+                        decimal eodMove = openPosition.Direction == SignalDirection.LONG
+                            ? eodEstPrice - openPosition.EntryPrice
+                            : openPosition.EntryPrice - eodEstPrice;
+                        decimal eodPnl = eodMove * eodMulti * openPosition.Contracts;
+
+                        logger.LogExit(DateTime.Now, openPosition, eodEstPrice, eodPnl, "EOD");
+                        FinalizeAndLogTradeRecord("EOD", eodEstPrice, eodPnl, openPosition, DateTime.Now, "estimated");
+
                         string exitAction = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
                         connector.PlaceMarketOrder(contract, exitAction, openPosition.Contracts);
                         await Task.Delay(3000); // wait for fill callback
                         logger.LogStatus(DateTime.Now, $"EOD_FLATTEN: market order placed to close {openPosition.Direction} position");
+                    }
+                    else if (openPosition != null && !_entryConfirmed)
+                    {
+                        // Unconfirmed entry (no fill yet) — discard TradeRecord
+                        _tradeRecord = null;
                     }
 
                     if (strategy is TTMSqueezePullbackStrategy ttmEod)
@@ -389,6 +424,52 @@ public class LiveTradingEngine
                     targetOrderId = null;
                     _entryConfirmed = false;
                 }
+            }
+
+            // ── News blackout: cancel pending entries and block new ones during high-impact events ──
+            // For confirmed positions (stop/target already placed) we keep the bracket — a market
+            // order into an NFP spike gives worse slippage than letting the stop work naturally.
+            // Refresh calendar if >12 h stale (fires at most once per 12 h, otherwise instant no-op)
+            await _newsCalendar.RefreshIfStaleAsync();
+            bool inNewsBlackout = _newsCalendar.IsBlackout(out string newsReason);
+            if (inNewsBlackout && !_newsBlackoutActive)
+            {
+                _newsBlackoutActive = true;
+                logger.LogStatus(DateTime.Now,
+                    $"NEWS_BLACKOUT: {newsReason} release window — pausing new entries");
+
+                // Cancel any unconfirmed (not yet filled) limit entry and its bracket
+                if (openPosition != null && !_entryConfirmed)
+                {
+                    if (entryOrderId.HasValue)  connector.CancelOrder(entryOrderId.Value);
+                    if (stopOrderId.HasValue)   connector.CancelOrder(stopOrderId.Value);
+                    if (targetOrderId.HasValue) connector.CancelOrder(targetOrderId.Value);
+                    logger.LogExit(DateTime.Now, openPosition, openPosition.EntryPrice, 0m, "NEWS_CANCELLED");
+                    openPosition  = null;
+                    entryOrderId  = null;
+                    stopOrderId   = null;
+                    targetOrderId = null;
+                    _entryConfirmed = false;
+                    _tradeRecord  = null;
+                }
+                // Cancel a pending entry-only order with no confirmed fill
+                else if (entryOrderId.HasValue && openPosition == null)
+                {
+                    connector.CancelOrder(entryOrderId.Value);
+                    entryOrderId = null;
+                }
+                // Clear any armed intrabar watch so we don't fire into the event
+                if (_intrabarWatch != null)
+                {
+                    logger.LogStatus(DateTime.Now,
+                        $"NEWS_BLACKOUT: clearing intrabar watch ({_intrabarWatch.Direction} @ {_intrabarWatch.EntryPrice:F2})");
+                    _intrabarWatch = null;
+                }
+            }
+            else if (!inNewsBlackout && _newsBlackoutActive)
+            {
+                _newsBlackoutActive = false;
+                logger.LogStatus(DateTime.Now, $"NEWS_BLACKOUT: {newsReason} window passed — resuming normal operation");
             }
 
             // Block new entries after EOD cutoff (including weekends)
@@ -421,6 +502,7 @@ public class LiveTradingEngine
                 stopOrderId = null;
                 targetOrderId = null;
                 _entryConfirmed = false;
+                _tradeRecord = null; // no fill → no CSV row
             }
 
             // Position reconciliation every 60 seconds
@@ -429,6 +511,17 @@ public class LiveTradingEngine
                 _positionSeenInReconcile = false;
                 connector.RequestPositions();
                 lastReconcile = DateTime.Now;
+            }
+
+            // Order liveness check every 5 minutes — ensure stop/target are still active in IBKR.
+            // Catches cases where orders were silently cancelled after startup (e.g. IBKR system
+            // events, partial connectivity loss, or a restart that placed orders but crashed
+            // before logging the new IDs).
+            if (_entryConfirmed && openPosition != null &&
+                (DateTime.Now - _lastOrderVerify).TotalMinutes >= 5)
+            {
+                _lastOrderVerify = DateTime.Now;
+                await VerifyExitOrdersAsync();
             }
         }
 
@@ -504,6 +597,7 @@ public class LiveTradingEngine
             stopOrderId = null;
             targetOrderId = null;
             _entryConfirmed = false;
+            _tradeRecord = null; // no fill → no CSV row
         }
 
         // Recalculate indicators (safe - skips existing via ContainsKey)
@@ -536,7 +630,7 @@ public class LiveTradingEngine
         }
 
         // Check for new entry if no position and no pending entry or watch
-        if (openPosition == null && entryOrderId == null && _intrabarWatch == null && !_eodFlattenDone)
+        if (openPosition == null && entryOrderId == null && _intrabarWatch == null && !_eodFlattenDone && !_newsBlackoutActive)
         {
             var current1h = bars1h.LastOrDefault(b => b.Timestamp <= now);
             if (current1h == null) return;
@@ -659,6 +753,7 @@ public class LiveTradingEngine
 
                 string exitReason = orderId == stopOrderId ? "STOP" : "TARGET";
                 logger.LogExit(now, openPosition, avgPrice, pnl, exitReason);
+                FinalizeAndLogTradeRecord(exitReason, avgPrice, pnl, openPosition, now, "real");
 
                 // Update stats
                 totalTrades++;
@@ -708,7 +803,7 @@ public class LiveTradingEngine
         //   Step 2  — check current offer (≈ last traded price ≈ close of this tick):
         //             offer ≤ EMA + 0.1 ATR  → MARKET ORDER  (price is right at EMA now)
         //             offer > EMA            → LIMIT ORDER at EMA  (price bounced, wait for return)
-        if (_intrabarWatch == null || openPosition != null || entryOrderId != null || _eodFlattenDone)
+        if (_intrabarWatch == null || openPosition != null || entryOrderId != null || _eodFlattenDone || _newsBlackoutActive)
             return;
 
         decimal formingHigh  = h;
@@ -782,8 +877,69 @@ public class LiveTradingEngine
             EntryStrategy   = setup.SetupType
         };
 
+        // Build the TradeRecord — filled in progressively until exit
+        var utcSignal = barTime.ToUniversalTime();
+        var h1bars    = aggregator.Bars1Hour;
+        decimal? ema1h = null;
+        if (h1bars.Count >= 2 && h1bars[^2].Metadata?.TryGetValue("ema_21", out var e1h) == true && e1h is decimal e1hVal)
+            ema1h = e1hVal;
+        setup.Metadata.TryGetValue("histogram_color",    out var histColorObj);
+        setup.Metadata.TryGetValue("distance_from_ema_atr", out var distEmaObj);
+
+        _tradeRecord = new TradeRecord
+        {
+            Asset                   = asset,
+            Direction               = setup.Direction,
+            SetupType               = setup.SetupType,
+            SignalTime              = barTime,
+            OrderType               = isMarket ? "MARKET" : "LIMIT",
+            IntendedEma             = roundedEntry,
+            StopPrice               = roundedStop,
+            TargetPrice             = roundedTarget,
+            Atr15m                  = _intrabarWatchAtr,
+            Ema1h                   = ema1h,
+            HistColor               = histColorObj?.ToString() ?? "",
+            DistEmaAtr              = distEmaObj is double dist ? (decimal)dist : (decimal?)null,
+            Contracts               = contracts,
+            Session                 = TradeRecord.GetSession(utcSignal),
+            DayOfWeek               = utcSignal.DayOfWeek.ToString(),
+            UtcHour                 = utcSignal.Hour,
+            ConsecutiveStopsAtEntry = _consecutiveStops
+        };
+
         if (strategy is TTMSqueezePullbackStrategy ttm)
             ttm.SetLastExitBar(-999);
+    }
+
+    /// <summary>
+    /// Completes the current TradeRecord with exit data and writes it to trades_history.csv.
+    /// Safe to call from any exit path (BAR_EXPIRED/LIMIT_EXPIRED callers set _tradeRecord=null instead).
+    /// Updates _consecutiveStops streak counter.
+    /// </summary>
+    private void FinalizeAndLogTradeRecord(string reason, decimal exitPrice, decimal pnl, Position pos, DateTime exitTime, string quality)
+    {
+        if (_tradeRecord == null) return;
+
+        decimal totalRisk = pos.RiskPerContract * pos.Contracts;
+        _tradeRecord.ExitTime    = exitTime;
+        _tradeRecord.ExitType    = TradeRecord.MapExitType(reason);
+        _tradeRecord.ExitPrice   = exitPrice;
+        _tradeRecord.ExitQuality = quality;
+        _tradeRecord.Pnl         = pnl;
+        _tradeRecord.RMultiple   = totalRisk != 0
+            ? Math.Round(pnl / totalRisk, 3)
+            : (decimal?)null;
+        _tradeRecord.DurationMins = _tradeRecord.EntryTime.HasValue
+            ? (int)(exitTime - _tradeRecord.EntryTime.Value).TotalMinutes
+            : (int?)null;
+
+        logger.LogTradeRecord(_tradeRecord);
+
+        // Update consecutive stops streak
+        if (reason == "STOP") _consecutiveStops++;
+        else _consecutiveStops = 0;
+
+        _tradeRecord = null;
     }
 
     // execDetails fires on every fill — more reliable than orderStatus for bracket child orders.
@@ -801,6 +957,15 @@ public class LiveTradingEngine
             {
                 openPosition.EntryPrice = fillPrice;
                 logger.LogStatus(now, $"Position opened (exec): {openPosition.Direction} {asset} {qty}x @ ${fillPrice:F2}");
+            }
+            // Record actual fill on the TradeRecord
+            if (_tradeRecord != null)
+            {
+                _tradeRecord.FillPrice = fillPrice;
+                _tradeRecord.EntryTime = now;
+                _tradeRecord.OffsetPct = _tradeRecord.IntendedEma != 0
+                    ? Math.Round((fillPrice - _tradeRecord.IntendedEma) / _tradeRecord.IntendedEma * 100m, 4)
+                    : (decimal?)null;
             }
             return;
         }
@@ -821,6 +986,7 @@ public class LiveTradingEngine
             string exitReason = orderId == stopOrderId ? "STOP" : "TARGET";
             logger.LogFill(now, orderId, fillPrice, qty);
             logger.LogExit(now, openPosition, fillPrice, pnl, exitReason);
+            FinalizeAndLogTradeRecord(exitReason, fillPrice, pnl, openPosition, now, "real");
 
             totalTrades++;
             totalPnL += pnl;
@@ -853,6 +1019,7 @@ public class LiveTradingEngine
 
         logger.LogStatus(now, $"RECONCILE: IBKR flat but bot had {pos.Direction} open @ ${pos.EntryPrice:F2} — synthetic exit @ ${lastClose:F2} (~${pnl:F2})");
         logger.LogExit(now, pos, lastClose, pnl, "RECONCILE");
+        FinalizeAndLogTradeRecord("RECONCILE", lastClose, pnl, pos, now, "estimated");
 
         if (snapStop.HasValue)   connector.CancelOrder(snapStop.Value);
         if (snapTarget.HasValue) connector.CancelOrder(snapTarget.Value);
@@ -1021,6 +1188,67 @@ public class LiveTradingEngine
         if (!_positionSeenInReconcile && openPosition != null)
         {
             HandlePositionUpdate(asset, 0);
+        }
+    }
+
+    /// <summary>
+    /// Verify that stop and target orders are still active in IBKR.
+    /// Called periodically (every 5 min) while a confirmed position is open.
+    /// Re-places exit orders if they have disappeared (cancelled during a restart or
+    /// by IBKR system events) so the position is never left unprotected.
+    /// </summary>
+    private async Task VerifyExitOrdersAsync()
+    {
+        if (openPosition == null || !_entryConfirmed) return;
+        if (!stopOrderId.HasValue && !targetOrderId.HasValue) return;
+
+        var liveIds = new HashSet<int>();
+        var tcs     = new TaskCompletionSource<bool>();
+
+        // Use local handler refs so we can unsubscribe cleanly after the check
+        Action<int, string> orderHandler = (orderId, symbol) =>
+        {
+            if (symbol.Equals(asset, StringComparison.OrdinalIgnoreCase))
+                liveIds.Add(orderId);
+        };
+        Action endHandler = () => tcs.TrySetResult(true);
+
+        connector.OnOpenOrder    += orderHandler;
+        connector.OnOpenOrderEnd += endHandler;
+
+        connector.RequestAllOpenOrders();
+        await Task.WhenAny(tcs.Task, Task.Delay(3000));
+
+        connector.OnOpenOrder    -= orderHandler;
+        connector.OnOpenOrderEnd -= endHandler;
+
+        bool stopMissing   = stopOrderId.HasValue   && !liveIds.Contains(stopOrderId.Value);
+        bool targetMissing = targetOrderId.HasValue && !liveIds.Contains(targetOrderId.Value);
+
+        if (!stopMissing && !targetMissing) return; // all present — nothing to do
+
+        logger.LogStatus(DateTime.Now,
+            $"ORDER_VERIFY: stop #{stopOrderId} live={!stopMissing}, target #{targetOrderId} live={!targetMissing} — re-placing exit orders");
+
+        var (newStop, newTarget) = connector.PlaceExitOrders(
+            contract, openPosition.Direction,
+            openPosition.StopLoss, openPosition.Target);
+
+        if (newStop > 0)
+        {
+            stopOrderId   = newStop;
+            targetOrderId = newTarget;
+            string exitAction = openPosition.Direction == SignalDirection.LONG ? "SELL" : "BUY";
+            logger.LogOrder(DateTime.Now, newStop,   exitAction, "STP", openPosition.StopLoss, 1);
+            logger.LogOrder(DateTime.Now, newTarget, exitAction, "LMT", openPosition.Target,   1);
+            logger.LogStatus(DateTime.Now,
+                $"ORDER_VERIFY: exit orders re-placed — new stop=#{newStop} @ ${openPosition.StopLoss:F2}, target=#{newTarget} @ ${openPosition.Target:F2}");
+        }
+        else
+        {
+            logger.LogError(DateTime.Now,
+                "ORDER_VERIFY: PlaceExitOrders failed (not connected?) — position unprotected! Will retry in 5 min.");
+            // Leave _lastOrderVerify as-is (set to Now before this call) so retry fires in 5 min
         }
     }
 
@@ -1340,4 +1568,5 @@ public class LiveTradingEngine
 
         return (bars15m, bars1h);
     }
+
 }

@@ -386,6 +386,57 @@ BacktestResult RunFullAnalysis(string symbol, List<Bar> bars15m, List<Bar> bars1
     var baseResult = RunBacktest(symbol, bars15m, bars1h);
     PrintBaselineResults(baseResult, symbol);
 
+    // ── A-2) DMI FILTER IMPACT ──
+    Console.WriteLine("\n── A-2) DMI FILTER IMPACT (15m +DI/-DI alignment) ──\n");
+
+    var noDmiStrategy = new TTMSqueezePullbackStrategy(symbol);
+    noDmiStrategy.SetParameter("use_dmi_filter", false);
+    var noDmiEngine = new BacktestEngine(noDmiStrategy,
+        new RiskManager(AccountMode.Challenge, startingBalance, startingBalance, maxDailyLoss), symbol);
+    var noDmiResult = noDmiEngine.Run(bars15m, bars1h);
+
+    // Summary table: WITH vs WITHOUT
+    int dmiTradesDelta = baseResult.TotalTrades - noDmiResult.TotalTrades;
+    decimal dmiPnlDelta = baseResult.TotalPnL - noDmiResult.TotalPnL;
+    decimal dmiWrDelta  = baseResult.WinRate   - noDmiResult.WinRate;
+
+    Console.WriteLine($"  {"",22} {"WITHOUT DMI",12} {"WITH DMI",12} {"Delta",10}");
+    Console.WriteLine($"  {"─────────────────────────────────────────────────────────"}");
+    Console.WriteLine($"  {"Trades",-22} {noDmiResult.TotalTrades,12} {baseResult.TotalTrades,12} {dmiTradesDelta,+10}");
+    Console.WriteLine($"  {"Win Rate",-22} {noDmiResult.WinRate,11:F1}% {baseResult.WinRate,11:F1}% {dmiWrDelta,+9:F1}%");
+    Console.WriteLine($"  {"Gross P&L",-22} {"$"+noDmiResult.TotalPnL.ToString("F0"),12} {"$"+baseResult.TotalPnL.ToString("F0"),12} {"$"+dmiPnlDelta.ToString("+#;-#;0"),10}");
+    Console.WriteLine($"  {"Profit Factor",-22} {noDmiResult.ProfitFactor,12:F2} {baseResult.ProfitFactor,12:F2}");
+    Console.WriteLine($"  {"Max Drawdown",-22} {"$"+noDmiResult.MaxDrawdown.ToString("F0"),12} {"$"+baseResult.MaxDrawdown.ToString("F0"),12}");
+
+    // Per-direction breakdown (what the filter removed)
+    var noDmiLongs  = noDmiResult.Trades.Where(t => t.Direction == SignalDirection.LONG).ToList();
+    var noDmiShorts = noDmiResult.Trades.Where(t => t.Direction == SignalDirection.SHORT).ToList();
+    var dmiLongs    = baseResult.Trades.Where(t => t.Direction == SignalDirection.LONG).ToList();
+    var dmiShorts   = baseResult.Trades.Where(t => t.Direction == SignalDirection.SHORT).ToList();
+
+    decimal noDmiLongWr  = noDmiLongs.Count  > 0 ? (decimal)noDmiLongs.Count(t  => t.PnL > 0) / noDmiLongs.Count  * 100 : 0;
+    decimal noDmiShortWr = noDmiShorts.Count > 0 ? (decimal)noDmiShorts.Count(t => t.PnL > 0) / noDmiShorts.Count * 100 : 0;
+    decimal dmiLongWr    = dmiLongs.Count    > 0 ? (decimal)dmiLongs.Count(t    => t.PnL > 0) / dmiLongs.Count    * 100 : 0;
+    decimal dmiShortWr   = dmiShorts.Count   > 0 ? (decimal)dmiShorts.Count(t   => t.PnL > 0) / dmiShorts.Count   * 100 : 0;
+
+    Console.WriteLine($"\n  Direction breakdown:");
+    Console.WriteLine($"  {"",22} {"WITHOUT DMI",12} {"WITH DMI",12} {"Delta",10}");
+    Console.WriteLine($"  {"─────────────────────────────────────────────────────────"}");
+    Console.WriteLine($"  {"LONG  trades",-22} {noDmiLongs.Count,12} {dmiLongs.Count,12} {dmiLongs.Count - noDmiLongs.Count,+10}");
+    Console.WriteLine($"  {"LONG  WR",-22} {noDmiLongWr,11:F1}% {dmiLongWr,11:F1}% {dmiLongWr - noDmiLongWr,+9:F1}%");
+    Console.WriteLine($"  {"LONG  P&L",-22} {"$"+noDmiLongs.Sum(t => t.PnL).ToString("F0"),12} {"$"+dmiLongs.Sum(t => t.PnL).ToString("F0"),12}");
+    Console.WriteLine($"  {"SHORT trades",-22} {noDmiShorts.Count,12} {dmiShorts.Count,12} {dmiShorts.Count - noDmiShorts.Count,+10}");
+    Console.WriteLine($"  {"SHORT WR",-22} {noDmiShortWr,11:F1}% {dmiShortWr,11:F1}% {dmiShortWr - noDmiShortWr,+9:F1}%");
+    Console.WriteLine($"  {"SHORT P&L",-22} {"$"+noDmiShorts.Sum(t => t.PnL).ToString("F0"),12} {"$"+dmiShorts.Sum(t => t.PnL).ToString("F0"),12}");
+
+    string dmiVerdict = dmiPnlDelta >= 0 && baseResult.WinRate >= noDmiResult.WinRate
+        ? "IMPROVES strategy (higher P&L + WR)"
+        : dmiPnlDelta >= 0
+            ? "IMPROVES P&L but reduces trade count"
+            : "REDUCES P&L — filter too aggressive for this dataset";
+
+    Console.WriteLine($"\n  DMI verdict: {dmiVerdict}");
+
     // ── B) COST ANALYSIS ──
     Console.WriteLine("\n── B) COST ANALYSIS (Slippage + Commissions) ──\n");
 

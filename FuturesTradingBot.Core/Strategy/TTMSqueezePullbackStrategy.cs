@@ -52,7 +52,8 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
                     { "trend_ride_threshold", 1.5m },  // Activate when 1H is 1.5+ ATR from EMA
                     { "trend_ride_tolerance", 0.8m },   // Pullback tolerance to 9 EMA
                     { "trend_ride_stop_atr", 1.0m },    // Tighter stop in strong trend
-                    { "trend_ride_trail_atr", 1.5m }    // Trailing stop distance
+                    { "trend_ride_trail_atr", 1.5m },   // Trailing stop distance
+                    { "use_dmi_filter", true }          // 15m +DI/-DI directional alignment filter
                 };
                 break;
 
@@ -70,7 +71,8 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
                     { "trend_ride_threshold", 1.5m },
                     { "trend_ride_tolerance", 0.8m },
                     { "trend_ride_stop_atr", 1.0m },
-                    { "trend_ride_trail_atr", 1.5m }
+                    { "trend_ride_trail_atr", 1.5m },
+                    { "use_dmi_filter", true }          // 15m +DI/-DI directional alignment filter
                 };
                 break;
 
@@ -193,12 +195,23 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         decimal tolerance, decimal stopAtr, decimal targetAtr,
         decimal trendDist, string color, decimal confidence, string regime)
     {
+        bool useDmi = Parameters.TryGetValue("use_dmi_filter", out var dmiFlag) && Convert.ToBoolean(dmiFlag);
+
         if (isUptrend)
         {
             if (color == "red") return null;
             // Yellow = histogram below zero but rising → counter-momentum long, poor edge
             // MGC: 12.5% WR (-$1,927), MES: 7.7% WR (-$464) in 60-day backtest
             if (color == "yellow") return null;
+
+            // DMI alignment: require +DI > -DI for longs (upward directional pressure dominates)
+            if (useDmi)
+            {
+                var plusDi  = GetIndicator(current15m, "plus_di_14");
+                var minusDi = GetIndicator(current15m, "minus_di_14");
+                if (plusDi.HasValue && minusDi.HasValue && plusDi.Value <= minusDi.Value)
+                    return null;
+            }
 
             var distLow = (current15m.Low - ema21) / atr;
             var distClose = (current15m.Close - ema21) / atr;
@@ -239,6 +252,15 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
             // Dark_blue = histogram above zero but falling → counter-momentum short, poor edge
             // MGC: 8.3% WR (-$2,921), MES: 15.4% WR (-$758) in 60-day backtest
             if (color == "dark_blue") return null;
+
+            // DMI alignment: require -DI > +DI for shorts (downward directional pressure dominates)
+            if (useDmi)
+            {
+                var plusDi  = GetIndicator(current15m, "plus_di_14");
+                var minusDi = GetIndicator(current15m, "minus_di_14");
+                if (plusDi.HasValue && minusDi.HasValue && minusDi.Value <= plusDi.Value)
+                    return null;
+            }
 
             var distHigh = (current15m.High - ema21) / atr;
             var distClose = (current15m.Close - ema21) / atr;
@@ -287,12 +309,21 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
         var trendRideTolerance = (decimal)Parameters["trend_ride_tolerance"];
         var trendRideStopAtr = (decimal)Parameters["trend_ride_stop_atr"];
         var trendRideTrailAtr = (decimal)Parameters["trend_ride_trail_atr"];
+        bool useDmiTr = Parameters.TryGetValue("use_dmi_filter", out var dmiTrFlag) && Convert.ToBoolean(dmiTrFlag);
 
         if (isUptrend)
         {
             if (color == "red") return null;
             // Yellow = histogram below zero but rising → counter-momentum long, poor edge
             if (color == "yellow") return null;
+
+            if (useDmiTr)
+            {
+                var plusDi  = GetIndicator(current15m, "plus_di_14");
+                var minusDi = GetIndicator(current15m, "minus_di_14");
+                if (plusDi.HasValue && minusDi.HasValue && plusDi.Value <= minusDi.Value)
+                    return null;
+            }
 
             // Check pullback to 9 EMA
             var distLow = (current15m.Low - ema9) / atr;
@@ -340,6 +371,14 @@ public class TTMSqueezePullbackStrategy : BaseStrategy
             if (color == "light_blue") return null;
             // Dark_blue = histogram above zero but falling → counter-momentum short, poor edge
             if (color == "dark_blue") return null;
+
+            if (useDmiTr)
+            {
+                var plusDi  = GetIndicator(current15m, "plus_di_14");
+                var minusDi = GetIndicator(current15m, "minus_di_14");
+                if (plusDi.HasValue && minusDi.HasValue && minusDi.Value <= plusDi.Value)
+                    return null;
+            }
 
             var distHigh = (current15m.High - ema9) / atr;
             var distClose = (current15m.Close - ema9) / atr;

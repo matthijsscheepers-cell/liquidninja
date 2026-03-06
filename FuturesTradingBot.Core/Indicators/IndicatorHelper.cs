@@ -23,6 +23,9 @@ public static class IndicatorHelper
 
         // TTM Momentum (for histogram color)
         TTMMomentum.AddToBarList(bars, 34, "ttm_momentum");
+
+        // DMI 14 (+DI / -DI) for directional pressure filter
+        DMI.AddToBarList(bars, 14);
     }
 
     /// <summary>
